@@ -1,0 +1,3 @@
+[submodule "ext/cuda-tile"]
+	path = ext/cuda-tile
+	url = https://github.com/NVIDIA/cuda-tile.git
