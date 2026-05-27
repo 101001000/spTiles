@@ -31,11 +31,28 @@ file(CREATE_LINK
   SYMBOLIC
 )
 
+find_package(Vulkan REQUIRED)
+
 add_subdirectory("${cuda_tile_source_dir}" "${cuda_tile_binary_dir}")
 
 add_executable(sp_tiles_translate
   src/main.cpp
 )
+
+add_executable(sp_tiles_translate_test
+  src/examples.cpp
+)
+
+target_link_libraries(sp_tiles_translate_test PRIVATE Vulkan::Vulkan)
+
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(sp_tiles_translate
+    PRIVATE
+      -fno-rtti
+      -fno-exceptions
+  )
+endif()
 
 target_include_directories(sp_tiles_translate
   PRIVATE
@@ -57,6 +74,11 @@ target_link_libraries(sp_tiles_translate
     MLIRDialect
     MLIRIR
     MLIRSupport
+    MLIRPass
+    MLIRSPIRVDialect
+    MLIRSPIRVConversion
+    MLIRSPIRVSerialization
+    MLIRSPIRVTransforms
 
     MLIRFunctionInterfaces
     MLIRControlFlowInterfaces

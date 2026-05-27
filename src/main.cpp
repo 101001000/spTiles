@@ -14,6 +14,48 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Target/SPIRV/Serialization.h"
+
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/FileSystem.h"
+#include "mlir/Dialect/SPIRV/Transforms/Passes.h"
+
+#include "lower.hpp"
+
+std::unique_ptr<mlir::Pass> create_cuda_tile_module_to_spirv_pass();
+
+static mlir::LogicalResult
+save_spirv_binary(mlir::spirv::ModuleOp spirv_module,
+                  llvm::StringRef output_path) {
+    llvm::SmallVector<uint32_t, 0> binary;
+
+    if (mlir::failed(mlir::spirv::serialize(spirv_module, binary))) {
+        return mlir::failure();
+    }
+
+    std::error_code error_code;
+    llvm::raw_fd_ostream output(output_path, error_code,
+                                llvm::sys::fs::OF_None);
+
+    if (error_code) {
+        llvm::errs() << "error: could not open output file '" << output_path
+                     << "': " << error_code.message() << "\n";
+        return mlir::failure();
+    }
+
+    output.write(reinterpret_cast<const char *>(binary.data()),
+                 binary.size() * sizeof(uint32_t));
+    output.flush();
+
+    return mlir::success();
+}
+
 static mlir::OwningOpRef<mlir::Operation *>
 load_cuda_tile_mlir(llvm::MemoryBufferRef buffer_ref,
                     mlir::MLIRContext &context) {
@@ -68,10 +110,12 @@ int main(int argc, char **argv) {
     }
 
     mlir::DialectRegistry registry;
-    registry.insert<mlir::cuda_tile::CudaTileDialect>();
+    registry.insert<mlir::cuda_tile::CudaTileDialect,
+                    mlir::spirv::SPIRVDialect>();
 
     mlir::MLIRContext context(registry);
-    context.loadDialect<mlir::cuda_tile::CudaTileDialect>();
+    context.loadDialect<mlir::cuda_tile::CudaTileDialect,
+                        mlir::spirv::SPIRVDialect>();
 
     mlir::OwningOpRef<mlir::Operation *> op =
         load_cuda_tile_file(argv[1], context);
@@ -89,6 +133,55 @@ int main(int argc, char **argv) {
     llvm::outs() << "loaded CUDA Tile input successfully\n";
     op->print(llvm::outs());
     llvm::outs() << "\n";
+
+    mlir::OwningOpRef<mlir::ModuleOp> wrapper(
+    mlir::ModuleOp::create((*op)->getLoc()));
+
+    wrapper->getBody()->getOperations().push_back(op.release());
+
+    mlir::PassManager pm(&context);
+
+    // The intermediate IR is intentionally invalid as real SPIR-V.
+    pm.enableVerifier(false);
+
+    pm.addPass(create_cuda_tile_module_to_spirv_pass());
+
+    pm.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
+
+    if (mlir::failed(pm.run(*wrapper))) {
+        llvm::errs() << "error: CUDA Tile to SPIR-V module pass failed\n";
+        return 1;
+    }
+
+    llvm::outs() << "converted CUDA Tile module shell to SPIR-V module shell\n";
+    wrapper->print(llvm::outs());
+    llvm::outs() << "\n";
+
+     mlir::spirv::ModuleOp spirv_module = nullptr;
+
+    wrapper->walk([&](mlir::spirv::ModuleOp module) {
+        spirv_module = module;
+        return mlir::WalkResult::interrupt();
+    });
+
+    if (!spirv_module) {
+        llvm::errs() << "error: no spirv.module found after lowering\n";
+        return 1;
+    }
+
+    if (mlir::failed(mlir::verify(spirv_module))) {
+        llvm::errs() << "error: generated SPIR-V module verification failed\n";
+        return 1;
+    }
+
+    std::string output_path = "./output.spv";
+
+    if (mlir::failed(save_spirv_binary(spirv_module, output_path))) {
+        llvm::errs() << "error: failed to serialize SPIR-V binary\n";
+        return 1;
+    }
+
+    llvm::outs() << "wrote SPIR-V binary to " << output_path << "\n";
 
     return 0;
 }
