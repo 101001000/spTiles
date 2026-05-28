@@ -56,18 +56,21 @@ struct CudaTileModuleToSpirvPass
 
 private:
 
+    uint32_t local_size_x = 1024;
+
     struct TensorViewInfo {
         mlir::Value base;
         llvm::SmallVector<mlir::Value> shape;
-        mlir::Type type;
+        mlir::Type type; // Esto debería ser mlir::cuda_tile::TensorViewType
         mlir::Operation *source_op;
     };
 
     struct PartitionViewInfo {
         mlir::Value tensor_view;
         mlir::Value base;
-        mlir::Type type;
+        mlir::cuda_tile::PartitionViewType type;
         mlir::Operation *source_op;
+        uint32_t tile_size;
     };
 
     llvm::DenseSet<mlir::Value> tokens;
@@ -208,30 +211,51 @@ private:
         }
 
         mlir::Value base = it->second.base;
+        uint32_t tile_size = it->second.tile_size;
 
         mlir::Type i32_type = builder.getI32Type();
 
-        mlir::Value c16 = mlir::spirv::ConstantOp::create(
+        mlir::Value c_tile_size = mlir::spirv::ConstantOp::create(
             builder,
             loc,
             i32_type,
-            builder.getI32IntegerAttr(16));
+            builder.getI32IntegerAttr(tile_size));
+
+        mlir::Value c0 = mlir::spirv::ConstantOp::create(
+            builder,
+            loc,
+            i32_type,
+            builder.getI32IntegerAttr(0));
 
         mlir::Value lane = get_or_create_lane_id(op, builder);
+
+        mlir::Value active = mlir::spirv::ULessThanOp::create(
+            builder,
+            loc,
+            lane,
+            c_tile_size);
+
+        mlir::Value safe_lane = mlir::spirv::SelectOp::create(
+            builder,
+            loc,
+            i32_type,
+            active,
+            lane,
+            c0);
 
         mlir::Value tile_base = mlir::spirv::IMulOp::create(
             builder,
             loc,
             i32_type,
             block_id_x,
-            c16);
+            c_tile_size);
 
         mlir::Value idx = mlir::spirv::IAddOp::create(
             builder,
             loc,
             i32_type,
             tile_base,
-            lane);
+            safe_lane);
 
         mlir::Value ptr = create_storage_buffer_access(
             builder,
@@ -304,6 +328,7 @@ private:
         op->erase();
     }
 
+
     void lower_store_view_tko(mlir::Operation *op) {
         if (op->getNumOperands() != 4) {
             op->emitError("expected store_view_tko with exactly 4 operands");
@@ -330,6 +355,7 @@ private:
         }
 
         mlir::Value base = it->second.base;
+        int64_t tile_size = it->second.tile_size;
 
         auto base_type = mlir::dyn_cast<mlir::spirv::PointerType>(base.getType());
         if (!base_type) {
@@ -346,20 +372,26 @@ private:
 
         mlir::Type i32_type = builder.getI32Type();
 
-        mlir::Value c16 = mlir::spirv::ConstantOp::create(
+        mlir::Value c_tile_size = mlir::spirv::ConstantOp::create(
             builder,
             loc,
             i32_type,
-            builder.getI32IntegerAttr(16));
+            builder.getI32IntegerAttr(static_cast<int32_t>(tile_size)));
 
         mlir::Value lane = get_or_create_lane_id(op, builder);
+
+        mlir::Value active = mlir::spirv::ULessThanOp::create(
+            builder,
+            loc,
+            lane,
+            c_tile_size);
 
         mlir::Value tile_base = mlir::spirv::IMulOp::create(
             builder,
             loc,
             i32_type,
             block_id_x,
-            c16);
+            c_tile_size);
 
         mlir::Value idx = mlir::spirv::IAddOp::create(
             builder,
@@ -367,6 +399,33 @@ private:
             i32_type,
             tile_base,
             lane);
+
+        auto selection_op = mlir::spirv::SelectionOp::create(
+            builder,
+            loc,
+            mlir::spirv::SelectionControl::None);
+
+        mlir::Region &region = selection_op.getBody();
+        auto *header_block = new mlir::Block();
+        auto *then_block = new mlir::Block();
+        auto *merge_block = new mlir::Block();
+
+        region.push_back(header_block);
+        region.push_back(then_block);
+        region.push_back(merge_block);
+
+        builder.setInsertionPointToStart(header_block);
+
+        mlir::spirv::BranchConditionalOp::create(
+            builder,
+            loc,
+            active,
+            then_block,
+            mlir::ValueRange{},
+            merge_block,
+            mlir::ValueRange{});
+
+        builder.setInsertionPointToStart(then_block);
 
         mlir::Value ptr = create_storage_buffer_access(
             builder,
@@ -381,6 +440,16 @@ private:
             value,
             nullptr,
             nullptr);
+
+        mlir::spirv::BranchOp::create(
+            builder,
+            loc,
+            merge_block);
+
+        builder.setInsertionPointToStart(merge_block);
+        mlir::spirv::MergeOp::create(builder, loc);
+
+        builder.setInsertionPointAfter(selection_op);
 
         op->getResult(0).replaceAllUsesWith(token);
         op->erase();
@@ -526,6 +595,7 @@ private:
 
             mlir::Value tensor_view = op->getOperand(0);
             mlir::Value result = op->getResult(0);
+            
 
             auto tensor_it = tensor_views.find(tensor_view);
             if (tensor_it == tensor_views.end()) {
@@ -534,11 +604,26 @@ private:
                 return;
             }
 
+            auto partition_type =
+            mlir::dyn_cast<mlir::cuda_tile::PartitionViewType>(result.getType());
+
+            if (!partition_type) {
+                op->emitError("result is not a cuda_tile partition view");
+                signalPassFailure();
+                return;
+            }
+
             PartitionViewInfo info;
             info.tensor_view = tensor_view;
             info.base = tensor_it->second.base;
-            info.type = result.getType();
+            info.type = partition_type;
             info.source_op = op;
+
+            uint32_t tile_size = 1;
+            for (uint32_t dim : partition_type.getTileShape().asArrayRef()) {
+                tile_size *= dim;
+            }
+            info.tile_size = tile_size;
 
             partition_views[result] = info;
         });
@@ -758,7 +843,7 @@ private:
             mlir::MLIRContext *context = func.getContext();
 
             llvm::SmallVector<int32_t, 3> workgroup_size;
-            workgroup_size.push_back(16);
+            workgroup_size.push_back(local_size_x);
             workgroup_size.push_back(1);
             workgroup_size.push_back(1);
 
