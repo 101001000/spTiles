@@ -40,15 +40,15 @@ struct CudaTileModuleToSpirvPass
         replace_entries(root_module);
 
         collect_tokens(root_module);
-        collect_and_erase_assumes(root_module);
+        collect_assumes(root_module);
+        collect_reshapes(root_module);
         collect_tensor_views(root_module);
         collect_partition_views(root_module);
 
         lower_cuda_tile_ops(root_module);
 
-        erase_metadata_ops(root_module);
+        erase_lowered_cuda_tile_ops(root_module);
 
-        erase_unused_spirv_func_args(root_module);
         attach_spirv_abi_attrs(root_module);
 
         replace_returns(root_module);
@@ -56,7 +56,14 @@ struct CudaTileModuleToSpirvPass
 
 private:
 
-    uint32_t local_size_x = 1024;
+    uint32_t local_size_x = 16;
+
+    struct EntryArrayInfo {
+        mlir::Value array;
+        llvm::SmallVector<mlir::Value, 3> lengths;
+        llvm::SmallVector<mlir::Value, 3> strides;
+        uint32_t dimensions = 0;
+    };
 
     struct TensorViewInfo {
         mlir::Value base;
@@ -74,24 +81,51 @@ private:
     };
 
     llvm::DenseSet<mlir::Value> tokens;
-    llvm::DenseMap<mlir::Value, mlir::Value> value_aliases;
     llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Attribute>> assumptions;
+    llvm::DenseMap<mlir::Value, EntryArrayInfo> entry_arrays;
     llvm::DenseMap<mlir::Value, TensorViewInfo> tensor_views;
     llvm::DenseMap<mlir::Value, PartitionViewInfo> partition_views;
+    llvm::DenseMap<mlir::Value, mlir::Value> forwarded_values;
+    llvm::DenseMap<mlir::Value, mlir::Value> lowered_values;
 
-    static bool is_op(mlir::Operation *op, llvm::StringRef name) {
-        return op->getName().getStringRef() == name;
-    }
-
-    mlir::Value canonical_value(mlir::Value value) {
+    mlir::Value get_forwarded_value(mlir::Value value) {
         while (true) {
-            auto it = value_aliases.find(value);
-            if (it == value_aliases.end()) {
+            auto it = forwarded_values.find(value);
+            if (it == forwarded_values.end()) {
                 return value;
             }
 
             value = it->second;
         }
+    }
+
+    void add_forwarded_value(mlir::Value result, mlir::Value source) {
+        forwarded_values[result] = get_forwarded_value(source);
+    }
+
+    mlir::Value get_lowered_value(mlir::Value value) {
+        value = get_forwarded_value(value);
+
+        auto it = lowered_values.find(value);
+        if (it == lowered_values.end()) {
+            return {};
+        }
+
+        return it->second;
+    }
+
+
+    static bool is_op(mlir::Operation *op, llvm::StringRef name) {
+        return op->getName().getStringRef() == name;
+    }
+
+    static bool is_entry_array_base_type(mlir::Type type) {
+        return mlir::isa<mlir::spirv::PointerType>(type);
+    }
+
+    static bool is_i32_type(mlir::Type type) {
+        auto integer_type = mlir::dyn_cast<mlir::IntegerType>(type);
+        return integer_type && integer_type.getWidth() == 32;
     }
 
     std::string type_to_string(mlir::Type type) {
@@ -173,6 +207,55 @@ private:
             builder.getI32ArrayAttr({0}));
     }
 
+    mlir::Value get_or_create_workgroup_id_x(mlir::Operation *op,
+                                             mlir::OpBuilder &builder) {
+        mlir::Location loc = op->getLoc();
+        mlir::Type i32_type = builder.getI32Type();
+
+        mlir::Value workgroup_id =
+            mlir::spirv::getBuiltinVariableValue(
+                op,
+                mlir::spirv::BuiltIn::WorkgroupId,
+                i32_type,
+                builder);
+
+        return mlir::spirv::CompositeExtractOp::create(
+            builder,
+            loc,
+            i32_type,
+            workgroup_id,
+            builder.getI32ArrayAttr({0}));
+    }
+
+    mlir::Value create_global_linear_id(mlir::Operation *op,
+                                        mlir::OpBuilder &builder) {
+        mlir::Location loc = op->getLoc();
+        mlir::Type i32_type = builder.getI32Type();
+
+        mlir::Value lane = get_or_create_lane_id(op, builder);
+        mlir::Value workgroup_id_x = get_or_create_workgroup_id_x(op, builder);
+
+        mlir::Value c_local_size_x = mlir::spirv::ConstantOp::create(
+            builder,
+            loc,
+            i32_type,
+            builder.getI32IntegerAttr(static_cast<int32_t>(local_size_x)));
+
+        mlir::Value group_base = mlir::spirv::IMulOp::create(
+            builder,
+            loc,
+            i32_type,
+            workgroup_id_x,
+            c_local_size_x);
+
+        return mlir::spirv::IAddOp::create(
+            builder,
+            loc,
+            i32_type,
+            group_base,
+            lane);
+    }
+
     mlir::Value create_storage_buffer_access(mlir::OpBuilder &builder,
                                              mlir::Location loc,
                                              mlir::Value base,
@@ -196,30 +279,30 @@ private:
             indices);
     }
 
-    void lower_load_view_tko(mlir::Operation *op) {
-        mlir::OpBuilder builder(op);
-        mlir::Location loc = op->getLoc();
-
-        mlir::Value pview = op->getOperand(0);
-        mlir::Value block_id_x = canonical_value(op->getOperand(1));
-        mlir::Value token = op->getOperand(2);
-
-        auto it = partition_views.find(pview);
-        if (it == partition_views.end()) {
-            op->emitError("unknown partition view");
-            return;
-        }
-
-        mlir::Value base = it->second.base;
-        uint32_t tile_size = it->second.tile_size;
-
+    void create_linearized_array_access(
+        mlir::OpBuilder &builder,
+        mlir::Location loc,
+        const EntryArrayInfo &info,
+        mlir::Value linear_id,
+        mlir::Value &active,
+        mlir::Value &index) {
         mlir::Type i32_type = builder.getI32Type();
 
-        mlir::Value c_tile_size = mlir::spirv::ConstantOp::create(
+        mlir::Value total_elements = info.lengths[0];
+        for (uint32_t dim = 1; dim < info.dimensions; ++dim) {
+            total_elements = mlir::spirv::IMulOp::create(
+                builder,
+                loc,
+                i32_type,
+                total_elements,
+                info.lengths[dim]);
+        }
+
+        active = mlir::spirv::ULessThanOp::create(
             builder,
             loc,
-            i32_type,
-            builder.getI32IntegerAttr(tile_size));
+            linear_id,
+            total_elements);
 
         mlir::Value c0 = mlir::spirv::ConstantOp::create(
             builder,
@@ -227,41 +310,144 @@ private:
             i32_type,
             builder.getI32IntegerAttr(0));
 
-        mlir::Value lane = get_or_create_lane_id(op, builder);
-
-        mlir::Value active = mlir::spirv::ULessThanOp::create(
-            builder,
-            loc,
-            lane,
-            c_tile_size);
-
-        mlir::Value safe_lane = mlir::spirv::SelectOp::create(
+        mlir::Value safe_linear_id = mlir::spirv::SelectOp::create(
             builder,
             loc,
             i32_type,
             active,
-            lane,
+            linear_id,
             c0);
 
-        mlir::Value tile_base = mlir::spirv::IMulOp::create(
-            builder,
-            loc,
-            i32_type,
-            block_id_x,
-            c_tile_size);
+        mlir::Value x = safe_linear_id;
+        if (info.dimensions > 1) {
+            x = mlir::spirv::UModOp::create(
+                builder,
+                loc,
+                i32_type,
+                safe_linear_id,
+                info.lengths[0]);
+        }
 
-        mlir::Value idx = mlir::spirv::IAddOp::create(
+        index = mlir::spirv::IMulOp::create(
             builder,
             loc,
             i32_type,
-            tile_base,
-            safe_lane);
+            x,
+            info.strides[0]);
+
+        if (info.dimensions > 1) {
+            mlir::Value linear_after_x = mlir::spirv::UDivOp::create(
+                builder,
+                loc,
+                i32_type,
+                safe_linear_id,
+                info.lengths[0]);
+
+            mlir::Value y = linear_after_x;
+            if (info.dimensions > 2) {
+                y = mlir::spirv::UModOp::create(
+                    builder,
+                    loc,
+                    i32_type,
+                    linear_after_x,
+                    info.lengths[1]);
+            }
+
+            mlir::Value y_offset = mlir::spirv::IMulOp::create(
+                builder,
+                loc,
+                i32_type,
+                y,
+                info.strides[1]);
+
+            index = mlir::spirv::IAddOp::create(
+                builder,
+                loc,
+                i32_type,
+                index,
+                y_offset);
+
+            if (info.dimensions > 2) {
+                mlir::Value z = mlir::spirv::UDivOp::create(
+                    builder,
+                    loc,
+                    i32_type,
+                    linear_after_x,
+                    info.lengths[1]);
+
+                mlir::Value z_offset = mlir::spirv::IMulOp::create(
+                    builder,
+                    loc,
+                    i32_type,
+                    z,
+                    info.strides[2]);
+
+                index = mlir::spirv::IAddOp::create(
+                    builder,
+                    loc,
+                    i32_type,
+                    index,
+                    z_offset);
+            }
+        }
+    }
+
+    void collect_assumes(mlir::ModuleOp root_module) {
+        root_module.walk([&](mlir::Operation *op) {
+            if (!is_op(op, "cuda_tile.assume")) {
+                return;
+            }
+
+            mlir::Value input = op->getOperand(0);
+            mlir::Value result = op->getResult(0);
+            mlir::Value base = get_forwarded_value(input);
+
+            if (auto predicate = op->getAttr("predicate")) {
+                assumptions[base].push_back(predicate);
+            }
+
+            add_forwarded_value(result, input);
+        });
+    }
+
+    void lower_load_view_tko(mlir::Operation *op) {
+        mlir::OpBuilder builder(op);
+        mlir::Location loc = op->getLoc();
+
+        mlir::Value pview = get_forwarded_value(op->getOperand(0));
+        mlir::Value token = op->getOperand(op->getNumOperands() - 1);
+
+        auto partition_it = partition_views.find(pview);
+        if (partition_it == partition_views.end()) {
+            op->emitError("unknown partition view");
+            return;
+        }
+
+        mlir::Value base = get_forwarded_value(partition_it->second.base);
+
+        auto array_it = entry_arrays.find(base);
+        if (array_it == entry_arrays.end()) {
+            op->emitError("partition view base is not a known entry array");
+            signalPassFailure();
+            return;
+        }
+
+        mlir::Value linear_id = create_global_linear_id(op, builder);
+        mlir::Value active;
+        mlir::Value index;
+        create_linearized_array_access(
+            builder,
+            loc,
+            array_it->second,
+            linear_id,
+            active,
+            index);
 
         mlir::Value ptr = create_storage_buffer_access(
             builder,
             loc,
             base,
-            idx);
+            index);
 
         mlir::Value loaded = mlir::spirv::LoadOp::create(
             builder,
@@ -270,9 +456,8 @@ private:
             nullptr,
             nullptr);
 
-        op->getResult(0).replaceAllUsesWith(loaded);
-        op->getResult(1).replaceAllUsesWith(token);
-        op->erase();
+        lowered_values[op->getResult(0)] = loaded;
+        add_forwarded_value(op->getResult(1), token);
     }
 
     void lower_get_tile_block_id(mlir::Operation *op) {
@@ -321,20 +506,49 @@ private:
                 workgroup_id,
                 builder.getI32ArrayAttr({2}));
 
-        op->getResult(0).replaceAllUsesWith(block_id_x);
-        op->getResult(1).replaceAllUsesWith(block_id_y);
-        op->getResult(2).replaceAllUsesWith(block_id_z);
-
-        op->erase();
+        lowered_values[op->getResult(0)] = block_id_x;
+        lowered_values[op->getResult(1)] = block_id_y;
+        lowered_values[op->getResult(2)] = block_id_z;
     }
 
+    void collect_reshapes(mlir::ModuleOp root_module) {
+        root_module.walk([&](mlir::Operation *op) {
+            if (!is_op(op, "cuda_tile.reshape")) {
+                return;
+            }
+
+            if (op->getNumOperands() != 1 || op->getNumResults() != 1) {
+                op->emitError("expected cuda_tile.reshape with one operand and one result");
+                signalPassFailure();
+                return;
+            }
+
+            add_forwarded_value(op->getResult(0), op->getOperand(0));
+        });
+    }
+
+    void erase_forwarded_ops(mlir::ModuleOp root_module) {
+        llvm::SmallVector<mlir::Operation *> ops;
+
+        root_module.walk([&](mlir::Operation *op) {
+            if (is_op(op, "cuda_tile.assume") ||
+                is_op(op, "cuda_tile.reshape")) {
+                ops.push_back(op);
+            }
+        });
+
+        for (mlir::Operation *op : llvm::reverse(ops)) {
+            if (!op->use_empty()) {
+                op->emitError("cannot erase forwarded op because it still has users");
+                signalPassFailure();
+                continue;
+            }
+
+            op->erase();
+        }
+    }
 
     void lower_store_view_tko(mlir::Operation *op) {
-        if (op->getNumOperands() != 4) {
-            op->emitError("expected store_view_tko with exactly 4 operands");
-            return;
-        }
-
         if (op->getNumResults() != 1) {
             op->emitError("expected store_view_tko to produce one token result");
             return;
@@ -343,19 +557,24 @@ private:
         mlir::OpBuilder builder(op);
         mlir::Location loc = op->getLoc();
 
-        mlir::Value value = op->getOperand(0);
-        mlir::Value pview = op->getOperand(1);
-        mlir::Value block_id_x = canonical_value(op->getOperand(2));
-        mlir::Value token = op->getOperand(3);
+        mlir::Value value = get_lowered_value(op->getOperand(0));
+        mlir::Value pview = get_forwarded_value(op->getOperand(1));
+        mlir::Value token = op->getOperand(op->getNumOperands() - 1);
 
-        auto it = partition_views.find(pview);
-        if (it == partition_views.end()) {
+        auto partition_it = partition_views.find(pview);
+        if (partition_it == partition_views.end()) {
             op->emitError("unknown partition view");
             return;
         }
 
-        mlir::Value base = it->second.base;
-        int64_t tile_size = it->second.tile_size;
+        mlir::Value base = get_forwarded_value(partition_it->second.base);
+
+        auto array_it = entry_arrays.find(base);
+        if (array_it == entry_arrays.end()) {
+            op->emitError("partition view base is not a known entry array");
+            signalPassFailure();
+            return;
+        }
 
         auto base_type = mlir::dyn_cast<mlir::spirv::PointerType>(base.getType());
         if (!base_type) {
@@ -370,35 +589,16 @@ private:
             return;
         }
 
-        mlir::Type i32_type = builder.getI32Type();
-
-        mlir::Value c_tile_size = mlir::spirv::ConstantOp::create(
+        mlir::Value linear_id = create_global_linear_id(op, builder);
+        mlir::Value active;
+        mlir::Value index;
+        create_linearized_array_access(
             builder,
             loc,
-            i32_type,
-            builder.getI32IntegerAttr(static_cast<int32_t>(tile_size)));
-
-        mlir::Value lane = get_or_create_lane_id(op, builder);
-
-        mlir::Value active = mlir::spirv::ULessThanOp::create(
-            builder,
-            loc,
-            lane,
-            c_tile_size);
-
-        mlir::Value tile_base = mlir::spirv::IMulOp::create(
-            builder,
-            loc,
-            i32_type,
-            block_id_x,
-            c_tile_size);
-
-        mlir::Value idx = mlir::spirv::IAddOp::create(
-            builder,
-            loc,
-            i32_type,
-            tile_base,
-            lane);
+            array_it->second,
+            linear_id,
+            active,
+            index);
 
         auto selection_op = mlir::spirv::SelectionOp::create(
             builder,
@@ -431,7 +631,7 @@ private:
             builder,
             loc,
             base,
-            idx);
+            index);
 
         mlir::spirv::StoreOp::create(
             builder,
@@ -451,8 +651,7 @@ private:
 
         builder.setInsertionPointAfter(selection_op);
 
-        op->getResult(0).replaceAllUsesWith(token);
-        op->erase();
+        add_forwarded_value(op->getResult(0), token);
     }
 
     void lower_addf(mlir::Operation *op) {
@@ -466,8 +665,8 @@ private:
             return;
         }
 
-        mlir::Value lhs = op->getOperand(0);
-        mlir::Value rhs = op->getOperand(1);
+        mlir::Value lhs = get_lowered_value(op->getOperand(0));
+        mlir::Value rhs = get_lowered_value(op->getOperand(1));
 
         if (lhs.getType() != rhs.getType()) {
             op->emitError("cuda_tile.addf operands must have the same lowered type, got ")
@@ -492,8 +691,7 @@ private:
             lhs,
             rhs);
 
-        op->getResult(0).replaceAllUsesWith(result);
-        op->erase();
+        lowered_values[op->getResult(0)] = result;
     }
 
     template <typename Callback>
@@ -560,6 +758,36 @@ private:
 
                 continue;
             }
+        }
+    }
+
+    bool is_erasable_cuda_tile_op(mlir::Operation *op) {
+    return is_op(op, "cuda_tile.assume") ||
+           is_op(op, "cuda_tile.reshape") ||
+           is_op(op, "cuda_tile.get_tile_block_id") ||
+           is_op(op, "cuda_tile.load_view_tko") ||
+           is_op(op, "cuda_tile.addf") ||
+           is_op(op, "cuda_tile.store_view_tko") ||
+           is_op(op, "cuda_tile.make_tensor_view") ||
+           is_op(op, "cuda_tile.make_partition_view") ||
+           is_op(op, "cuda_tile.make_token");
+    }
+
+    void erase_lowered_cuda_tile_ops(mlir::ModuleOp root_module) {
+        llvm::SmallVector<mlir::Operation *> ops;
+
+        root_module.walk([&](mlir::Operation *op) {
+            if (is_erasable_cuda_tile_op(op)) {
+                ops.push_back(op);
+            }
+        });
+
+        for (mlir::Operation *op : llvm::reverse(ops)) {
+            if (!op->use_empty()) {
+                op->emitError("cannot erase CUDA Tile op because it still has users");
+                signalPassFailure();
+                continue;
+            }
 
             op->erase();
         }
@@ -574,12 +802,12 @@ private:
             mlir::Value result = op->getResult(0);
 
             TensorViewInfo info;
-            info.base = canonical_value(op->getOperand(0));
+            info.base = get_forwarded_value(op->getOperand(0));
             info.type = result.getType();
             info.source_op = op;
 
             for (mlir::Value operand : op->getOperands().drop_front()) {
-                info.shape.push_back(canonical_value(operand));
+                info.shape.push_back(get_forwarded_value(operand));
             }
 
             tensor_views[result] = std::move(info);
@@ -593,7 +821,7 @@ private:
                 return;
             }
 
-            mlir::Value tensor_view = op->getOperand(0);
+            mlir::Value tensor_view = get_forwarded_value(op->getOperand(0));
             mlir::Value result = op->getResult(0);
             
 
@@ -628,34 +856,6 @@ private:
             partition_views[result] = info;
         });
     }
-
-    void collect_and_erase_assumes(mlir::ModuleOp root_module) {
-        llvm::SmallVector<mlir::Operation *> assume_ops;
-
-        root_module.walk([&](mlir::Operation *op) {
-            if (op->getName().getStringRef() == "cuda_tile.assume") {
-                assume_ops.push_back(op);
-            }
-        });
-
-        for (mlir::Operation *assume_op : assume_ops) {
-            mlir::Value input = assume_op->getOperand(0);
-            mlir::Value result = assume_op->getResult(0);
-            mlir::Value base = canonical_value(input);
-
-            if (auto predicate = assume_op->getAttr("predicate")) {
-                assumptions[base].push_back(predicate);
-            }
-
-            value_aliases[result] = base;
-
-            // Replace the refined value with the original base value.
-            result.replaceAllUsesWith(base);
-
-            assume_op->erase();
-        }
-    }
-
 
     void collect_tokens(mlir::ModuleOp root_module) {
         root_module.walk([&](mlir::Operation *op) {
@@ -720,6 +920,74 @@ private:
         }
     }
 
+    void collect_entry_array_params(mlir::spirv::FuncOp func) {
+        if (func.getBody().empty()) {
+            return;
+        }
+
+        mlir::Block &entry_block = func.getBody().front();
+        unsigned arg_count = entry_block.getNumArguments();
+
+        for (unsigned arg = 0; arg < arg_count;) {
+            mlir::BlockArgument array = entry_block.getArgument(arg);
+
+            if (!is_entry_array_base_type(array.getType())) {
+                ++arg;
+                continue;
+            }
+
+            unsigned metadata_begin = arg + 1;
+            unsigned metadata_end = metadata_begin;
+
+            while (metadata_end < arg_count &&
+                   !is_entry_array_base_type(
+                       entry_block.getArgument(metadata_end).getType())) {
+                mlir::BlockArgument metadata = entry_block.getArgument(metadata_end);
+
+                if (!is_i32_type(metadata.getType())) {
+                    func.emitError("expected i32 array metadata argument");
+                    signalPassFailure();
+                    return;
+                }
+
+                ++metadata_end;
+            }
+
+            unsigned metadata_count = metadata_end - metadata_begin;
+
+            if (metadata_count == 0 || metadata_count % 2 != 0) {
+                func.emitError("expected array arguments as ptr, lengths..., strides...");
+                signalPassFailure();
+                return;
+            }
+
+            unsigned dimensions = metadata_count / 2;
+
+            if (dimensions < 1 || dimensions > 3) {
+                func.emitError("only 1D, 2D and 3D arrays are supported");
+                signalPassFailure();
+                return;
+            }
+
+            EntryArrayInfo info;
+            info.array = array;
+            info.dimensions = dimensions;
+
+            for (unsigned dim = 0; dim < dimensions; ++dim) {
+                info.lengths.push_back(
+                    entry_block.getArgument(metadata_begin + dim));
+            }
+
+            for (unsigned dim = 0; dim < dimensions; ++dim) {
+                info.strides.push_back(
+                    entry_block.getArgument(metadata_begin + dimensions + dim));
+            }
+
+            entry_arrays[array] = std::move(info);
+            arg = metadata_end;
+        }
+    }
+
     void replace_entries(mlir::ModuleOp root_module) {
         llvm::SmallVector<mlir::Operation *> entries;
 
@@ -776,6 +1044,8 @@ private:
             for (unsigned i = 0; i < entry_block.getNumArguments(); ++i) {
                 entry_block.getArgument(i).setType(converted_function_type.getInput(i));
             }
+
+            collect_entry_array_params(spirv_func);
 
             entry->erase();
         }

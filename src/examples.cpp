@@ -148,6 +148,15 @@ void upload_f32_buffer(VkDevice device,
     vkUnmapMemory(device, buffer.memory);
 }
 
+void upload_i32_buffer(VkDevice device,
+                       const VulkanBuffer &buffer,
+                       int32_t value) {
+    void *mapped = nullptr;
+    VK_CHECK(vkMapMemory(device, buffer.memory, 0, buffer.size, 0, &mapped));
+    std::memcpy(mapped, &value, sizeof(value));
+    vkUnmapMemory(device, buffer.memory);
+}
+
 std::vector<float> download_f32_buffer(VkDevice device,
                                        const VulkanBuffer &buffer,
                                        size_t element_count) {
@@ -164,20 +173,26 @@ std::vector<float> download_f32_buffer(VkDevice device,
 int main(int argc, char **argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: " << argv[0] << " shader.spv [n]\n";
+            std::cerr << "usage: " << argv[0] << " shader.spv [size_x]\n";
             return 1;
         }
 
         std::string spirv_path = argv[1];
-        uint32_t n = 64;
+        uint32_t size_x = 1024;
+        uint32_t size_y = 1;
+        uint32_t size_z = 1;
 
         if (argc >= 3) {
-            n = static_cast<uint32_t>(std::stoul(argv[2]));
+            size_x = static_cast<uint32_t>(std::stoul(argv[2]));
         }
 
-        if (n == 0) {
-            throw std::runtime_error("n must be greater than zero");
+        if (size_x == 0) {
+            throw std::runtime_error("size_x must be greater than zero");
         }
+
+        uint32_t element_count = size_x * size_y * size_z;
+        int32_t size_arg_x = static_cast<int32_t>(size_x);
+        int32_t stride_arg_x = 1;
 
         std::vector<uint32_t> spirv_code = read_spirv_file(spirv_path);
 
@@ -218,7 +233,8 @@ int main(int argc, char **argv) {
         VkQueue queue = VK_NULL_HANDLE;
         vkGetDeviceQueue(device, queue_family_index, 0, &queue);
 
-        VkDeviceSize buffer_size = sizeof(float) * n;
+        VkDeviceSize buffer_size = sizeof(float) * element_count;
+        VkDeviceSize scalar_i32_buffer_size = sizeof(int32_t);
         VkMemoryPropertyFlags host_memory_flags =
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -244,18 +260,66 @@ int main(int argc, char **argv) {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             host_memory_flags);
 
-        std::vector<float> a(n);
-        std::vector<float> b(n);
-        std::vector<float> c(n, 0.0f);
+        VulkanBuffer buffer_a_size = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
 
-        for (uint32_t i = 0; i < n; ++i) {
+        VulkanBuffer buffer_a_stride = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
+
+        VulkanBuffer buffer_b_size = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
+
+        VulkanBuffer buffer_b_stride = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
+
+        VulkanBuffer buffer_c_size = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
+
+        VulkanBuffer buffer_c_stride = create_buffer(
+            physical_device,
+            device,
+            scalar_i32_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            host_memory_flags);
+
+        std::vector<float> a(element_count);
+        std::vector<float> b(element_count);
+        std::vector<float> c(element_count, 0.0f);
+
+        for (uint32_t i = 0; i < element_count; ++i) {
             a[i] = static_cast<float>(i);
             b[i] = static_cast<float>(1000 + i);
         }
 
         upload_f32_buffer(device, buffer_a, a);
+        upload_i32_buffer(device, buffer_a_size, size_arg_x);
+        upload_i32_buffer(device, buffer_a_stride, stride_arg_x);
         upload_f32_buffer(device, buffer_b, b);
+        upload_i32_buffer(device, buffer_b_size, size_arg_x);
+        upload_i32_buffer(device, buffer_b_stride, stride_arg_x);
         upload_f32_buffer(device, buffer_c, c);
+        upload_i32_buffer(device, buffer_c_size, size_arg_x);
+        upload_i32_buffer(device, buffer_c_stride, stride_arg_x);
 
         VkShaderModuleCreateInfo shader_module_info{};
         shader_module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -268,9 +332,10 @@ int main(int argc, char **argv) {
                                       nullptr,
                                       &shader_module));
 
-        VkDescriptorSetLayoutBinding bindings[3]{};
+        constexpr uint32_t descriptor_count = 9;
+        VkDescriptorSetLayoutBinding bindings[descriptor_count]{};
 
-        for (uint32_t i = 0; i < 3; ++i) {
+        for (uint32_t i = 0; i < descriptor_count; ++i) {
             bindings[i].binding = i;
             bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[i].descriptorCount = 1;
@@ -281,7 +346,7 @@ int main(int argc, char **argv) {
         VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info{};
         descriptor_set_layout_info.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        descriptor_set_layout_info.bindingCount = 3;
+        descriptor_set_layout_info.bindingCount = descriptor_count;
         descriptor_set_layout_info.pBindings = bindings;
 
         VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
@@ -323,7 +388,7 @@ int main(int argc, char **argv) {
 
         VkDescriptorPoolSize pool_size{};
         pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_size.descriptorCount = 3;
+        pool_size.descriptorCount = descriptor_count;
 
         VkDescriptorPoolCreateInfo descriptor_pool_info{};
         descriptor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -349,22 +414,38 @@ int main(int argc, char **argv) {
                                           &descriptor_set_alloc_info,
                                           &descriptor_set));
 
-        VkDescriptorBufferInfo buffer_infos[3]{};
-        buffer_infos[0].buffer = buffer_a.buffer;
-        buffer_infos[0].offset = 0;
-        buffer_infos[0].range = buffer_size;
+        VkBuffer descriptor_buffers[descriptor_count] = {
+            buffer_a.buffer,
+            buffer_a_size.buffer,
+            buffer_a_stride.buffer,
+            buffer_b.buffer,
+            buffer_b_size.buffer,
+            buffer_b_stride.buffer,
+            buffer_c.buffer,
+            buffer_c_size.buffer,
+            buffer_c_stride.buffer,
+        };
 
-        buffer_infos[1].buffer = buffer_b.buffer;
-        buffer_infos[1].offset = 0;
-        buffer_infos[1].range = buffer_size;
+        VkDeviceSize descriptor_ranges[descriptor_count] = {
+            buffer_size,
+            scalar_i32_buffer_size,
+            scalar_i32_buffer_size,
+            buffer_size,
+            scalar_i32_buffer_size,
+            scalar_i32_buffer_size,
+            buffer_size,
+            scalar_i32_buffer_size,
+            scalar_i32_buffer_size,
+        };
 
-        buffer_infos[2].buffer = buffer_c.buffer;
-        buffer_infos[2].offset = 0;
-        buffer_infos[2].range = buffer_size;
+        VkDescriptorBufferInfo buffer_infos[descriptor_count]{};
+        VkWriteDescriptorSet descriptor_writes[descriptor_count]{};
 
-        VkWriteDescriptorSet descriptor_writes[3]{};
+        for (uint32_t i = 0; i < descriptor_count; ++i) {
+            buffer_infos[i].buffer = descriptor_buffers[i];
+            buffer_infos[i].offset = 0;
+            buffer_infos[i].range = descriptor_ranges[i];
 
-        for (uint32_t i = 0; i < 3; ++i) {
             descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptor_writes[i].dstSet = descriptor_set;
             descriptor_writes[i].dstBinding = i;
@@ -374,7 +455,11 @@ int main(int argc, char **argv) {
             descriptor_writes[i].pBufferInfo = &buffer_infos[i];
         }
 
-        vkUpdateDescriptorSets(device, 3, descriptor_writes, 0, nullptr);
+        vkUpdateDescriptorSets(device,
+                               descriptor_count,
+                               descriptor_writes,
+                               0,
+                               nullptr);
 
         VkCommandPoolCreateInfo command_pool_info{};
         command_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -418,7 +503,8 @@ int main(int argc, char **argv) {
                                 nullptr);
 
         uint32_t local_size_x = 16;
-        uint32_t group_count_x = (n + local_size_x - 1) / local_size_x;
+        uint32_t group_count_x =
+            (element_count + local_size_x - 1) / local_size_x;
 
         vkCmdDispatch(command_buffer, group_count_x, 1, 1);
 
@@ -438,9 +524,10 @@ int main(int argc, char **argv) {
         VK_CHECK(vkQueueSubmit(queue, 1, &submit_info, fence));
         VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
 
-        std::vector<float> output = download_f32_buffer(device, buffer_c, n);
+        std::vector<float> output =
+            download_f32_buffer(device, buffer_c, element_count);
 
-        for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < element_count; ++i) {
             std::cout << i << ": " << a[i] << " + " << b[i]
                       << " = " << output[i] << "\n";
         }
@@ -461,6 +548,20 @@ int main(int argc, char **argv) {
 
         vkDestroyBuffer(device, buffer_c.buffer, nullptr);
         vkFreeMemory(device, buffer_c.memory, nullptr);
+
+        VulkanBuffer scalar_buffers[6] = {
+            buffer_a_size,
+            buffer_a_stride,
+            buffer_b_size,
+            buffer_b_stride,
+            buffer_c_size,
+            buffer_c_stride,
+        };
+
+        for (const VulkanBuffer &buffer : scalar_buffers) {
+            vkDestroyBuffer(device, buffer.buffer, nullptr);
+            vkFreeMemory(device, buffer.memory, nullptr);
+        }
 
         vkDestroyDevice(device, nullptr);
         vkDestroyInstance(instance, nullptr);
