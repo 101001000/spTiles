@@ -87,6 +87,7 @@ private:
     llvm::DenseMap<mlir::Value, PartitionViewInfo> partition_views;
     llvm::DenseMap<mlir::Value, mlir::Value> forwarded_values;
     llvm::DenseMap<mlir::Value, mlir::Value> lowered_values;
+    llvm::DenseSet<mlir::Operation *> lowered_ops;
 
     mlir::Value get_forwarded_value(mlir::Value value) {
         while (true) {
@@ -458,6 +459,7 @@ private:
 
         lowered_values[op->getResult(0)] = loaded;
         add_forwarded_value(op->getResult(1), token);
+        lowered_ops.insert(op);
     }
 
     void lower_get_tile_block_id(mlir::Operation *op) {
@@ -509,6 +511,7 @@ private:
         lowered_values[op->getResult(0)] = block_id_x;
         lowered_values[op->getResult(1)] = block_id_y;
         lowered_values[op->getResult(2)] = block_id_z;
+        lowered_ops.insert(op);
     }
 
     void collect_reshapes(mlir::ModuleOp root_module) {
@@ -652,6 +655,7 @@ private:
         builder.setInsertionPointAfter(selection_op);
 
         add_forwarded_value(op->getResult(0), token);
+        lowered_ops.insert(op);
     }
 
     void lower_addf(mlir::Operation *op) {
@@ -692,6 +696,7 @@ private:
             rhs);
 
         lowered_values[op->getResult(0)] = result;
+        lowered_ops.insert(op);
     }
 
     template <typename Callback>
@@ -761,35 +766,37 @@ private:
         }
     }
 
-    bool is_erasable_cuda_tile_op(mlir::Operation *op) {
-    return is_op(op, "cuda_tile.assume") ||
-           is_op(op, "cuda_tile.reshape") ||
-           is_op(op, "cuda_tile.get_tile_block_id") ||
-           is_op(op, "cuda_tile.load_view_tko") ||
-           is_op(op, "cuda_tile.addf") ||
-           is_op(op, "cuda_tile.store_view_tko") ||
-           is_op(op, "cuda_tile.make_tensor_view") ||
-           is_op(op, "cuda_tile.make_partition_view") ||
-           is_op(op, "cuda_tile.make_token");
+    bool is_lowering_cleanup_op(mlir::Operation *op) {
+        return lowered_ops.contains(op) ||
+               is_op(op, "cuda_tile.assume") ||
+               is_op(op, "cuda_tile.reshape") ||
+               is_op(op, "cuda_tile.make_tensor_view") ||
+               is_op(op, "cuda_tile.make_partition_view") ||
+               is_op(op, "cuda_tile.make_token");
     }
 
     void erase_lowered_cuda_tile_ops(mlir::ModuleOp root_module) {
-        llvm::SmallVector<mlir::Operation *> ops;
+        bool erased_any = true;
 
-        root_module.walk([&](mlir::Operation *op) {
-            if (is_erasable_cuda_tile_op(op)) {
-                ops.push_back(op);
+        while (erased_any) {
+            erased_any = false;
+            llvm::SmallVector<mlir::Operation *> ops;
+
+            root_module.walk([&](mlir::Operation *op) {
+                if (is_lowering_cleanup_op(op)) {
+                    ops.push_back(op);
+                }
+            });
+
+            for (mlir::Operation *op : llvm::reverse(ops)) {
+                if (!op->use_empty()) {
+                    continue;
+                }
+
+                lowered_ops.erase(op);
+                op->erase();
+                erased_any = true;
             }
-        });
-
-        for (mlir::Operation *op : llvm::reverse(ops)) {
-            if (!op->use_empty()) {
-                op->emitError("cannot erase CUDA Tile op because it still has users");
-                signalPassFailure();
-                continue;
-            }
-
-            op->erase();
         }
     }
 
