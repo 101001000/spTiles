@@ -40,6 +40,7 @@ struct AddFOpConversion final
     }
 };
 
+
 struct LoadViewTkoOpConversion final
     : mlir::OpConversionPattern<mlir::cuda_tile::LoadViewTkoOp> {
     LoadViewTkoOpConversion(
@@ -794,6 +795,21 @@ using DivIOpConversion =
         mlir::cuda_tile::DivIOp,
         mlir::spirv::UDivOp>;
 
+using RemIOpConversion =
+    ScalarIntegerBinaryOpConversion<
+        mlir::cuda_tile::RemIOp,
+        mlir::spirv::UModOp>;
+
+using AndIOpConversion =
+    ScalarIntegerBinaryOpConversion<
+        mlir::cuda_tile::AndIOp,
+        mlir::spirv::LogicalAndOp>;
+
+using XOrIOpConversion =
+    ScalarIntegerBinaryOpConversion<
+        mlir::cuda_tile::XOrIOp,
+        mlir::spirv::LogicalNotEqualOp>;
+
 
 struct AssumeOpConversion final
     : mlir::OpConversionPattern<mlir::cuda_tile::AssumeOp> {
@@ -814,55 +830,217 @@ struct AssumeOpConversion final
     }
 };
 
-struct MakeTokenCleanupPattern final
-    : mlir::OpRewritePattern<mlir::cuda_tile::MakeTokenOp> {
-    using mlir::OpRewritePattern<
-        mlir::cuda_tile::MakeTokenOp>::OpRewritePattern;
+struct MakeTokenOpConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::MakeTokenOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::MakeTokenOp>::OpConversionPattern;
 
     mlir::LogicalResult matchAndRewrite(
         mlir::cuda_tile::MakeTokenOp op,
-        mlir::PatternRewriter &rewriter) const override {
-        if (!op->use_empty()) {
-            return rewriter.notifyMatchFailure(op, "token still has uses");
-        }
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value token = mlir::spirv::ConstantOp::create(
+            rewriter,
+            op.getLoc(),
+            rewriter.getI32Type(),
+            rewriter.getI32IntegerAttr(0));
 
-        rewriter.eraseOp(op);
+        rewriter.replaceOp(op, token);
         return mlir::success();
     }
 };
 
-struct MakeTensorViewCleanupPattern final
-    : mlir::OpRewritePattern<mlir::cuda_tile::MakeTensorViewOp> {
-    using mlir::OpRewritePattern<
-        mlir::cuda_tile::MakeTensorViewOp>::OpRewritePattern;
-
+struct MakeTensorViewConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::MakeTensorViewOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::MakeTensorViewOp>::OpConversionPattern;
+    
     mlir::LogicalResult matchAndRewrite(
         mlir::cuda_tile::MakeTensorViewOp op,
-        mlir::PatternRewriter &rewriter) const override {
-        if (!op->use_empty()) {
-            return rewriter.notifyMatchFailure(
-                op, "tensor view still has uses");
-        }
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value token = mlir::spirv::ConstantOp::create(
+            rewriter,
+            op.getLoc(),
+            rewriter.getI32Type(),
+            rewriter.getI32IntegerAttr(0));
 
-        rewriter.eraseOp(op);
+        rewriter.replaceOp(op, token);
         return mlir::success();
     }
 };
 
-struct MakePartitionViewCleanupPattern final
-    : mlir::OpRewritePattern<mlir::cuda_tile::MakePartitionViewOp> {
-    using mlir::OpRewritePattern<
-        mlir::cuda_tile::MakePartitionViewOp>::OpRewritePattern;
+struct MakePartitionViewConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::MakePartitionViewOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::MakePartitionViewOp>::OpConversionPattern;
 
     mlir::LogicalResult matchAndRewrite(
         mlir::cuda_tile::MakePartitionViewOp op,
-        mlir::PatternRewriter &rewriter) const override {
-        if (!op->use_empty()) {
-            return rewriter.notifyMatchFailure(
-                op, "partition view still has uses");
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value token = mlir::spirv::ConstantOp::create(
+            rewriter,
+            op.getLoc(),
+            rewriter.getI32Type(),
+            rewriter.getI32IntegerAttr(0));
+
+        rewriter.replaceOp(op, token);
+        return mlir::success();
+    }
+};
+
+struct CmpIOpConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::CmpIOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::CmpIOp>::OpConversionPattern;
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::cuda_tile::CmpIOp op,
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value lhs = adaptor.getOperands()[0];
+        mlir::Value rhs = adaptor.getOperands()[1];
+
+        if (lhs.getType() != rhs.getType()) {
+            return rewriter.notifyMatchFailure(op, "operand type mismatch");
         }
 
-        rewriter.eraseOp(op);
+        mlir::Type bool_type = rewriter.getI1Type();
+
+        if (attr_contains(op.getOperation(), "comparison_predicate", "less_than")) {
+            mlir::Value result = mlir::spirv::ULessThanOp::create(
+                rewriter,
+                op.getLoc(),
+                bool_type,
+                lhs,
+                rhs);
+
+            rewriter.replaceOp(op, result);
+            return mlir::success();
+        }
+
+        if (attr_contains(op.getOperation(), "comparison_predicate", "not_equal")) {
+            mlir::Value result = mlir::spirv::INotEqualOp::create(
+                rewriter,
+                op.getLoc(),
+                bool_type,
+                lhs,
+                rhs);
+
+            rewriter.replaceOp(op, result);
+            return mlir::success();
+        }
+
+        return rewriter.notifyMatchFailure(
+            op, "unsupported comparison predicate");
+    }
+
+private:
+    static bool attr_contains(
+        mlir::Operation *op,
+        llvm::StringRef name,
+        llvm::StringRef text) {
+        mlir::Attribute attr = op->getAttr(name);
+        if (!attr) {
+            return false;
+        }
+
+        std::string value;
+        llvm::raw_string_ostream stream(value);
+        attr.print(stream);
+        stream.flush();
+
+        return llvm::StringRef(value).contains(text);
+    }
+};
+
+struct SelectOpConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::SelectOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::SelectOp>::OpConversionPattern;
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::cuda_tile::SelectOp op,
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value condition = adaptor.getOperands()[0];
+        mlir::Value true_value = adaptor.getOperands()[1];
+        mlir::Value false_value = adaptor.getOperands()[2];
+
+        if (true_value.getType() != false_value.getType()) {
+            return rewriter.notifyMatchFailure(op, "value type mismatch");
+        }
+
+        mlir::Value result = mlir::spirv::SelectOp::create(
+            rewriter,
+            op.getLoc(),
+            true_value.getType(),
+            condition,
+            true_value,
+            false_value);
+
+        rewriter.replaceOp(op, result);
+        return mlir::success();
+    }
+};
+
+struct MinIOpConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::MinIOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::MinIOp>::OpConversionPattern;
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::cuda_tile::MinIOp op,
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        mlir::Value lhs = adaptor.getOperands()[0];
+        mlir::Value rhs = adaptor.getOperands()[1];
+
+        if (lhs.getType() != rhs.getType()) {
+            return rewriter.notifyMatchFailure(op, "operand type mismatch");
+        }
+
+        auto integer_type = mlir::dyn_cast<mlir::IntegerType>(lhs.getType());
+        if (!integer_type) {
+            return rewriter.notifyMatchFailure(op, "expected integer operands");
+        }
+
+        mlir::Value condition = mlir::spirv::ULessThanOp::create(
+            rewriter,
+            op.getLoc(),
+            rewriter.getI1Type(),
+            lhs,
+            rhs);
+
+        mlir::Value result = mlir::spirv::SelectOp::create(
+            rewriter,
+            op.getLoc(),
+            lhs.getType(),
+            condition,
+            lhs,
+            rhs);
+
+        rewriter.replaceOp(op, result);
+        return mlir::success();
+    }
+};
+
+struct ReturnOpConversion final
+    : mlir::OpConversionPattern<mlir::cuda_tile::ReturnOp> {
+    using mlir::OpConversionPattern<
+        mlir::cuda_tile::ReturnOp>::OpConversionPattern;
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::cuda_tile::ReturnOp op,
+        OpAdaptor adaptor,
+        mlir::ConversionPatternRewriter &rewriter) const override {
+        if (!adaptor.getOperands().empty()) {
+            return rewriter.notifyMatchFailure(
+                op, "expected return without operands");
+        }
+
+        rewriter.replaceOpWithNewOp<mlir::spirv::ReturnOp>(op);
         return mlir::success();
     }
 };

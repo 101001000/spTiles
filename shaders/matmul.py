@@ -90,7 +90,7 @@ def matmul_kernel(A, B, C,
 
         # Perform Matrix Multiplication for the current tiles.
         # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
-        # accumulator = ct.mma(a, b, accumulator)
+        accumulator = ct.mma(a, b, accumulator)
 
     # Convert the final accumulated result to the desired output data type (C.dtype).
     # This might downcast from float32 to float16 if the output is float16.

@@ -50,25 +50,14 @@ struct CudaTileModuleToSpirvPass
         collect_tensor_views(root_module);
         collect_partition_views(root_module);
 
-        apply_spmd_value_conversion(root_module);
+        if (mlir::failed(apply_spmd_value_conversion(root_module))) {
+            signalPassFailure();
+            return;
+        }
+
+        erase_lowered_cuda_tile_ops(root_module);
 
         attach_spirv_abi_attrs(root_module);
-
-        replace_returns(root_module);
-
-        root_module.walk([&](mlir::Operation *op) {
-            if (op->getName().getDialectNamespace() != "cuda_tile") {
-                return;
-            }
-
-            
-            op->emitError("cuda_tile op left after lowering: ") << op->getName().getStringRef();
-
-            llvm::errs() << "\n=== remaining cuda_tile op ===\n";
-            op->print(llvm::errs(), mlir::OpPrintingFlags().printGenericOpForm());
-            llvm::errs() << "\n==============================\n";
-            llvm::errs().flush();
-        });
     }
 
 private:
@@ -94,7 +83,7 @@ private:
         }
     }
 
-    void apply_spmd_value_conversion(mlir::ModuleOp root_module) {
+    mlir::LogicalResult apply_spmd_value_conversion(mlir::ModuleOp root_module) {
         mlir::MLIRContext &context = getContext();
 
         mlir::ConversionTarget target(context);
@@ -103,6 +92,8 @@ private:
         target.addLegalDialect<mlir::spirv::SPIRVDialect>();
         target.addLegalDialect<mlir::BuiltinDialect>();
 
+        target.addIllegalDialect<mlir::cuda_tile::CudaTileDialect>();
+
         CudaTileSpmdLoweringContext lowering_context(
             local_size_x,
             entry_arrays,
@@ -110,62 +101,36 @@ private:
             partition_views,
             forwarded_values);
 
-        // Value ops
-        target.addIllegalOp<mlir::cuda_tile::ConstantOp>();
         patterns.add<ConstantOpConversion>(&context);
-
-        // Index-space ops
-        target.addIllegalOp<mlir::cuda_tile::GetTileBlockIdOp>();
         patterns.add<GetTileBlockIdOpConversion>(&context);
-
-        target.addIllegalOp<mlir::cuda_tile::GetIndexSpaceShapeOp>();
         patterns.add<GetIndexSpaceShapeOpConversion>(&context, lowering_context);
-
-        // View ops
-        target.addIllegalOp<mlir::cuda_tile::LoadViewTkoOp>();
         patterns.add<LoadViewTkoOpConversion>(&context, lowering_context);
-
-        target.addIllegalOp<mlir::cuda_tile::StoreViewTkoOp>();
         patterns.add<StoreViewTkoOpConversion>(&context, lowering_context);
-
-        target.addIllegalOp<mlir::cuda_tile::ReshapeOp>();
         patterns.add<ReshapeOpConversion>(&context);
-
-        // Floating-point arithmetic ops
-        target.addIllegalOp<mlir::cuda_tile::AddFOp>();
         patterns.add<AddFOpConversion>(&context);
-
-        // Integer arithmetic ops
-        target.addIllegalOp<mlir::cuda_tile::AddIOp>();
         patterns.add<AddIOpConversion>(&context);
-
-        target.addIllegalOp<mlir::cuda_tile::SubIOp>();
         patterns.add<SubIOpConversion>(&context);
-
-        target.addIllegalOp<mlir::cuda_tile::MulIOp>();
         patterns.add<MulIOpConversion>(&context);
-
-        target.addIllegalOp<mlir::cuda_tile::DivIOp>();
         patterns.add<DivIOpConversion>(&context);
-
-        // Control-flow ops
-        target.addIllegalOp<mlir::cuda_tile::ForOp>();
+        patterns.add<MinIOpConversion>(&context);
+        patterns.add<RemIOpConversion>(&context);
+        patterns.add<CmpIOpConversion>(&context);
+        patterns.add<AndIOpConversion>(&context);
+        patterns.add<XOrIOpConversion>(&context);
+        patterns.add<SelectOpConversion>(&context);
+        patterns.add<AssumeOpConversion>(&context);
+        patterns.add<ReturnOpConversion>(&context);
         patterns.add<ForOpConversion>(&context, lowering_context);
-
-        target.addIllegalOp<mlir::cuda_tile::ContinueOp>();
         patterns.add<ContinueOpConversion>(&context, lowering_context);
+        
+        patterns.add<MakeTokenOpConversion>(&context);
+        patterns.add<MakeTensorViewConversion>(&context);
+        patterns.add<MakePartitionViewConversion>(&context);
 
-        target.markUnknownOpDynamicallyLegal(
-            [](mlir::Operation *) {
-                return true;
-            });
-
-        if (mlir::failed(mlir::applyPartialConversion(
-                root_module,
-                target,
-                std::move(patterns)))) {
-            signalPassFailure();
-        }
+        return mlir::applyPartialConversion(
+            root_module,
+            target,
+            std::move(patterns));
     }
 
     void add_forwarded_value(mlir::Value result, mlir::Value source) {
@@ -658,24 +623,6 @@ private:
                         storage_class,
                         context));
             }
-        }
-    }
-
-    void replace_returns(mlir::ModuleOp root_module) {
-        llvm::SmallVector<mlir::Operation *> returns;
-
-        root_module.walk([&](mlir::Operation *op) {
-            if (is_op(op, "cuda_tile.return")) {
-                returns.push_back(op);
-            }
-        });
-
-        for (mlir::Operation *ret : returns) {
-            mlir::OpBuilder builder(ret);
-
-            mlir::spirv::ReturnOp::create(builder, ret->getLoc());
-
-            ret->erase();
         }
     }
 };
