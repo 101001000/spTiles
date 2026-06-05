@@ -1,0 +1,9 @@
+BasedOnStyle: LLVM
+ColumnLimit: 1200
+
+UseTab: ForIndentation
+IndentWidth: 4
+TabWidth: 4
+
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 1000000
