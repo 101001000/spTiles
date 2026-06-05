@@ -21,6 +21,68 @@
 
 namespace {
 
+static bool is_cuda_tile_op(mlir::Operation *op) { return op && op->getName().getDialectNamespace() == "cuda_tile"; }
+
+static void print_value_chain(mlir::Value value, unsigned depth = 0) {
+	for (unsigned i = 0; i < depth; ++i)
+		llvm::errs() << "  ";
+
+	llvm::errs() << "- value type: ";
+	value.getType().print(llvm::errs());
+	llvm::errs() << "\n";
+
+	if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+		for (unsigned i = 0; i < depth; ++i)
+			llvm::errs() << "  ";
+
+		llvm::errs() << "  block argument #" << block_arg.getArgNumber() << "\n";
+		return;
+	}
+
+	mlir::Operation *def = value.getDefiningOp();
+	if (!def)
+		return;
+
+	for (unsigned i = 0; i < depth; ++i)
+		llvm::errs() << "  ";
+
+	llvm::errs() << "  produced by: " << def->getName().getStringRef() << "\n";
+
+	if (!is_cuda_tile_op(def))
+		return;
+
+	if (depth >= 4)
+		return;
+
+	for (unsigned i = 0; i < def->getNumOperands(); ++i) {
+		for (unsigned j = 0; j < depth; ++j)
+			llvm::errs() << "  ";
+
+		llvm::errs() << "  operand " << i << ":\n";
+		print_value_chain(def->getOperand(i), depth + 2);
+	}
+}
+
+static void debug_remaining_cuda_tile_ops(mlir::ModuleOp root_module) {
+	root_module.walk([&](mlir::Operation *op) {
+		if (!is_cuda_tile_op(op))
+			return;
+
+		if (op->hasTrait<mlir::OpTrait::IsTerminator>())
+			return;
+
+		llvm::errs() << "\nremaining cuda_tile op: " << op->getName().getStringRef() << "\n";
+		llvm::errs() << "op: ";
+		op->print(llvm::errs());
+		llvm::errs() << "\n";
+
+		for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+			llvm::errs() << "operand " << i << ":\n";
+			print_value_chain(op->getOperand(i), 1);
+		}
+	});
+}
+
 struct CudaTileModuleToSpirvPass : public mlir::PassWrapper<CudaTileModuleToSpirvPass, mlir::OperationPass<mlir::ModuleOp>> {
 	MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CudaTileModuleToSpirvPass)
 
@@ -266,17 +328,18 @@ struct CudaTileModuleToSpirvPass : public mlir::PassWrapper<CudaTileModuleToSpir
 		target.addLegalDialect<mlir::spirv::SPIRVDialect>();
 		target.addLegalDialect<mlir::BuiltinDialect>();
 
-		target.addIllegalOp<mlir::cuda_tile::StoreViewTkoOp>();
 		target.addIllegalOp<mlir::cuda_tile::ReturnOp>();
+		target.addIllegalOp<mlir::cuda_tile::StoreViewTkoOp>();
 
 		target.markUnknownOpDynamicallyLegal([](mlir::Operation *) { return true; });
 
 		TileMaterializer materializer(lowering_context);
 
-		patterns.add<StoreViewTkoOpConversion>(&context, materializer);
 		patterns.add<ReturnOpConversion>(&context);
+		patterns.add<StoreViewTkoOpConversion>(&context, materializer);
 
 		if (mlir::failed(mlir::applyPartialConversion(root_module, target, std::move(patterns)))) {
+			debug_remaining_cuda_tile_ops(root_module);
 			signalPassFailure();
 			return;
 		}
