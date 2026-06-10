@@ -174,6 +174,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    llvm::SmallVector<uint32_t, 0> binary;
+
+    mlir::spirv::SerializationOptions options;
+    options.emitDebugInfo = true;
+
+    if (mlir::failed(mlir::spirv::serialize(spirv_module, binary, options))) {
+        llvm::errs() << "error: SPIR-V serialization failed\n";
+        spirv_module.print(llvm::errs());
+        llvm::errs() << "\n";
+        return 1;
+    }
+
     std::string output_path = "./output.spv";
 
     if (mlir::failed(save_spirv_binary(spirv_module, output_path))) {
