@@ -77,20 +77,21 @@ def matmul_kernel(A, B, C,
     # K-dimension loop: Iterate over the K-dimension in chunks of 'tk'.
     # In each iteration, a `tm` x `tk` tile from A and a `tk` x `tn` tile from B
     # are loaded, multiplied, and accumulated.
-    for k in range(num_tiles_k):
+    k = 0
+    #for k in range(num_tiles_k):
         # Load tile from matrix A.
         # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
         # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-        a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
+    a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
 
         # Load tile from matrix B.
         # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
         # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-        b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
+    b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
 
         # Perform Matrix Multiplication for the current tiles.
         # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
-        accumulator = ct.mma(a, b, accumulator)
+    accumulator = ct.mma(a, b, accumulator)
 
     # Convert the final accumulated result to the desired output data type (C.dtype).
     # This might downcast from float32 to float16 if the output is float16.
@@ -100,80 +101,6 @@ def matmul_kernel(A, B, C,
     # The `(bidx, bidy)` directly corresponds to the tile's position in the 2D output matrix.
     ct.store(C, index=(bidx, bidy), tile=accumulator)
 
-
-@ct.kernel
-def persistent_matmul_kernel(A, B, C,
-                             tm: ConstInt,   # Tile size along M dimension (rows of C)
-                             tn: ConstInt,   # Tile size along N dimension (columns of C)
-                             tk: ConstInt):  # Tile size along K dimension
-    """
-    cuTile persistent kernel for performing matrix multiplication C = A @ B.
-
-    This kernel uses a persistent approach, where NUM_SMS tile blocks are launched
-    and each tile block processes multiple output tiles.
-
-    Args:
-        A: Input matrix A (M x K).
-        B: Input matrix B (K x N).
-        C: Output matrix C (M x N).
-        tm (ConstInt): The height of the output tile computed by this block.
-                       Corresponds to rows of A and C.
-        tn (ConstInt): The width of the output tile computed by this block.
-                       Corresponds to columns of B and C.
-        tk (ConstInt): The depth of the inner loop (K-dimension) tile size.
-                       Corresponds to columns of A and rows of B.
-    """
-    GROUP_SIZE_M = 8
-
-    bid = ct.bid(0)
-    M = A.shape[0]
-    N = B.shape[1]
-
-    # Calculate the total number of K-tiles that need to be processed.
-    # `ct.num_tiles(A, axis=1, shape=(tm, tk))` extracts the K-dimension (axis 1)
-    # from matrix A's shape, assuming A's shape is conceptually (M_tiles, K_tiles),
-    # and then implicitly performs ceiling division by `tk` to get the number of K-tiles.
-    num_tiles_k = ct.num_tiles(A, axis=1, shape=(tm, tk))
-    zero_pad = ct.PaddingMode.ZERO
-
-    # Convert fp32 to tf32 to use tensorcore
-    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
-
-    # Number of tiles along M and N
-    num_bid_m = ct.cdiv(M, tm)
-    num_bid_n = ct.cdiv(N, tn)
-    upper_bound = num_bid_m * num_bid_n
-
-    # Static persistent loop: each program processes multiple tiles.
-    num_tile_blocks = ct.num_blocks(0)
-    for current_bid in range(bid, upper_bound, num_tile_blocks):
-        # Initialize an accumulator for the current output tile (tm x tn).
-        # It's common practice to use `float32` for accumulation even with `float16` inputs
-        # to maintain higher precision during the sum-reduction of the matrix multiplication.
-        accumulator = ct.full((tm, tn), 0, dtype=ct.float32)
-        bidx, bidy = swizzle_2d_from_bid(M, N, tm, tn, GROUP_SIZE_M, current_bid)
-
-        # K-dimension loop: Iterate over the K-dimension in chunks of 'tk'.
-        # In each iteration, a `tm` x `tk` tile from A and a `tk` x `tn` tile from B
-        # are loaded, multiplied, and accumulated.
-        for k in range(num_tiles_k):
-            # Load tile from matrix A.
-            # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
-            # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-            a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
-
-            # Load tile from matrix B.
-            # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
-            # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-            b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
-
-            # Perform Matrix Multiplication for the current tiles.
-            # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
-            accumulator = ct.mma(a, b, accumulator)
-
-        # Cast result back to C.dtype and store
-        accumulator = ct.astype(accumulator, C.dtype)
-        ct.store(C, index=(bidx, bidy), tile=accumulator)
 
 
 def cutile_matmul(A: torch.Tensor, B: torch.Tensor, persistent: bool = False) -> torch.Tensor:
@@ -287,9 +214,9 @@ def compile_only():
 
     fp32_signature = make_matmul_signature(
         dtype=ct.float32,
-        tm=32,
-        tn=32,
-        tk=32,
+        tm=64,
+        tn=64,
+        tk=64,
         symbol="matmul_fp32",
     )
 
