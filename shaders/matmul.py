@@ -74,25 +74,25 @@ def matmul_kernel(A, B, C,
     # Convert fp32 to tf32 to use tensorcore
     dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
 
-    k = 0
+    #k = 0
 
     # K-dimension loop: Iterate over the K-dimension in chunks of 'tk'.
     # In each iteration, a `tm` x `tk` tile from A and a `tk` x `tn` tile from B
     # are loaded, multiplied, and accumulated.
-    #for k in range(num_tiles_k):
+    for k in range(num_tiles_k):
         # Load tile from matrix A.
         # The `index=(bidx, k_tile_idx)` specifies which (M-tile, K-tile) to load
         # from global memory A. `shape=(tm, tk)` defines the size of this tile.
-    a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
+        a = ct.load(A, index=(bidx, k), shape=(tm, tk), padding_mode=zero_pad).astype(dtype)
 
         # Load tile from matrix B.
         # The `index=(k_tile_idx, bidy)` specifies which (K-tile, N-tile) to load
         # from global memory B. `shape=(tk, tn)` defines the size of this tile.
-    b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
+        b = ct.load(B, index=(k, bidy), shape=(tk, tn), padding_mode=zero_pad).astype(dtype)
 
         # Perform Matrix Multiplication for the current tiles.
         # `ct.mma` computes the product of the two loaded tiles and accumulates the result.
-    accumulator = ct.mma(a, b, accumulator)
+        accumulator = ct.mma(a, b, accumulator)
 
     # Convert the final accumulated result to the desired output data type (C.dtype).
     # This might downcast from float32 to float16 if the output is float16.

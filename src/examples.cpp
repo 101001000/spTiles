@@ -637,9 +637,18 @@ static void run_matmul_test(VulkanContext &context,
         {&buffer_c_stride1, i32_buffer_size},
     };
 
-    auto max = [](uint32_t x, uint32_t y) { return x > y ? x : y; };
+    auto ceil_div = [](uint32_t x, uint32_t y) {
+        return (x + y - 1) / y;
+    };
 
-    run.dispatch_x = max(a_count, max(b_count, c_count)) / local_size_x;
+    constexpr uint32_t tile_m = 32;
+    constexpr uint32_t tile_n = 32;
+    constexpr uint32_t tile_size = tile_m * tile_n;
+
+    uint32_t output_tile_count = ceil_div(m, tile_m) * ceil_div(n, tile_n);
+    uint32_t invocation_count = output_tile_count * tile_size;
+
+    run.dispatch_x = ceil_div(invocation_count, local_size_x);
     run.dispatch_y = 1;
     run.dispatch_z = 1;
 

@@ -173,7 +173,7 @@ struct TileMaterializer {
 				return materialize_binopi<mlir::cuda_tile::MulIOp, mlir::spirv::IMulOp>(muli_op, loc, rewriter, partition_view);
 
 			if (auto divi_op = mlir::dyn_cast<mlir::cuda_tile::DivIOp>(op))
-				return materialize_binopi<mlir::cuda_tile::DivIOp, mlir::spirv::UDivOp>(divi_op, loc, rewriter, partition_view);
+				return materialize_divi(divi_op, loc, rewriter, partition_view);
 
 			if (auto remi_op = mlir::dyn_cast<mlir::cuda_tile::RemIOp>(op))
 				return materialize_binopi<mlir::cuda_tile::RemIOp, mlir::spirv::UModOp>(remi_op, loc, rewriter, partition_view);
@@ -245,7 +245,8 @@ struct TileMaterializer {
 				return materialize_fadd(addf_op, loc, rewriter, element_index);
 
 			if (auto mmaf_op = mlir::dyn_cast<mlir::cuda_tile::MmaFOp>(op))
-				return materialize_mmaf_for(mmaf_op, loc, rewriter, element_index);
+				return materialize_mmaf_for(mmaf_op, loc, rewriter, element_index); // segfault
+				                                                                    // return materialize_mmaf(mmaf_op, loc, rewriter, element_index); // funciona
 
 			if (auto reshape_op = mlir::dyn_cast<mlir::cuda_tile::ReshapeOp>(op))
 				return materialize_tile_element(reshape_op.getSource(), loc, rewriter, element_index);
@@ -306,49 +307,47 @@ struct TileMaterializer {
 		PartitionViewInfo &pview_info = lowering_context.partition_views[partition_view];
 		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
 
+		assert(indices.size() == 2);
+		assert(pview_info.tile_shape.size() == 2);
+		assert(tview_info.shape.size() == 2);
+		assert(tview_info.strides.size() == 2);
+
 		mlir::Type i32_type = rewriter.getI32Type();
 
 		for (mlir::Value &index : indices)
 			index = materialize_scalar(index, loc, rewriter, partition_view);
 
-		mlir::Value tile_offset = indices[0];
+		auto get_index_value = [&](IndexValue value) -> mlir::Value {
+			if (value.is_static())
+				return get_or_create_i32_constant(value.static_value, loc, rewriter);
 
-		mlir::Value stride;
-		for (unsigned i = 1; i < indices.size(); ++i) {
-			IndexValue &extent = tview_info.shape[i - 1];
+			return materialize_scalar(value.dynamic_value, loc, rewriter, partition_view);
+		};
 
-			mlir::Value extent_value;
-			if (extent.is_static()) {
-				extent_value = mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, extent.static_value));
-			} else {
-				extent_value = materialize_scalar(extent.dynamic_value, loc, rewriter, partition_view);
-			}
+		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
 
-			if (stride)
-				stride = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, stride, extent_value);
-			else
-				stride = extent_value;
+		mlir::Value local_row = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, element_index, tile_n);
+		mlir::Value local_col = mlir::spirv::UModOp::create(rewriter, loc, i32_type, element_index, tile_n);
 
-			mlir::Value term = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[i], stride);
-			tile_offset = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, tile_offset, term);
-		}
+		mlir::Value global_row = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_m), local_row);
 
-		int32_t total_tile_size = 1;
-		for (int32_t value : pview_info.tile_shape)
-			total_tile_size *= value;
+		mlir::Value global_col = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[1], tile_n), local_col);
 
-		mlir::Value total_tile_size_value = mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, total_tile_size));
+		mlir::Value stride0 = get_index_value(tview_info.strides[0]);
+		mlir::Value stride1 = get_index_value(tview_info.strides[1]);
 
-		tile_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, tile_offset, total_tile_size_value);
-		tile_offset = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, tile_offset, element_index);
+		mlir::Value row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_row, stride0);
+		mlir::Value col_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_col, stride1);
+		mlir::Value linear_offset = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, row_offset, col_offset);
 
 		mlir::Value base_ptr = rewriter.getRemappedValue(tview_info.base_ptr);
 		if (!base_ptr)
 			base_ptr = tview_info.base_ptr;
 
-		mlir::Value member_index = mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, 0));
+		mlir::Value member_index = get_or_create_i32_constant(0, loc, rewriter);
 
-		return mlir::spirv::AccessChainOp::create(rewriter, loc, base_ptr, mlir::ValueRange{member_index, tile_offset});
+		return mlir::spirv::AccessChainOp::create(rewriter, loc, base_ptr, mlir::ValueRange{member_index, linear_offset});
 	}
 
 	mlir::Value get_or_create_global_linear_index(mlir::Operation *op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter) {
@@ -397,7 +396,6 @@ struct TileMaterializer {
 
 		MaterializationCacheKey key;
 		key.kind = MaterializationCacheKind::partition_local_linear_index;
-		key.op = op;
 		key.value = partition_view;
 		key.value2 = element_index;
 
@@ -410,7 +408,7 @@ struct TileMaterializer {
 			for (int32_t value : pview_info.tile_shape)
 				total_tile_size *= value;
 
-			mlir::Value total_tile_size_value = mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, total_tile_size));
+			mlir::Value total_tile_size_value = get_or_create_i32_constant(total_tile_size, loc, rewriter);
 
 			return mlir::spirv::UModOp::create(rewriter, loc, element_index, total_tile_size_value);
 		});
@@ -429,12 +427,116 @@ struct TileMaterializer {
 		return result;
 	}
 
+	mlir::Value materialize_partition_view_in_bounds(mlir::Value partition_view, llvm::SmallVector<mlir::Value> indices, mlir::Value element_index, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter) {
+		PartitionViewInfo &pview_info = lowering_context.partition_views[partition_view];
+		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
+
+		assert(indices.size() == 2);
+		assert(pview_info.tile_shape.size() == 2);
+
+		mlir::Type i32_type = rewriter.getI32Type();
+
+		for (mlir::Value &index : indices)
+			index = materialize_scalar(index, loc, rewriter, partition_view);
+
+		auto materialize_index_value = [&](IndexValue value) -> mlir::Value {
+			if (value.is_static())
+				return get_or_create_i32_constant(value.static_value, loc, rewriter);
+
+			return materialize_scalar(value.dynamic_value, loc, rewriter, partition_view);
+		};
+
+		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
+
+		mlir::Value local_row = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, element_index, tile_n);
+		mlir::Value local_col = mlir::spirv::UModOp::create(rewriter, loc, i32_type, element_index, tile_n);
+
+		mlir::Value global_row = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_m), local_row);
+
+		mlir::Value global_col = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[1], tile_n), local_col);
+
+		mlir::Value row_in_bounds = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_row, materialize_index_value(tview_info.shape[0]));
+		mlir::Value col_in_bounds = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_col, materialize_index_value(tview_info.shape[1]));
+
+		return mlir::spirv::LogicalAndOp::create(rewriter, loc, rewriter.getI1Type(), row_in_bounds, col_in_bounds);
+	}
+
 	mlir::Value materialize_load_view_tko(mlir::cuda_tile::LoadViewTkoOp op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value element_index) {
 		llvm::SmallVector<mlir::Value> indices(op.getIndex().begin(), op.getIndex().end());
 		mlir::Value partition = op.getView();
-		mlir::Value partition_local_index = get_or_create_partition_local_linear_index(op, partition, loc, rewriter, element_index);
-		mlir::Value element_ptr = materialize_partition_view_element_ptr(op.getView(), indices, partition_local_index, loc, rewriter);
-		return mlir::spirv::LoadOp::create(rewriter, loc, element_ptr);
+
+		PartitionViewInfo &pview_info = lowering_context.partition_views[partition];
+		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
+
+		mlir::Value partition_local_index = get_or_create_partition_local_linear_index(op.getOperation(), partition, loc, rewriter, element_index);
+
+		if (!pview_info.padding_value) {
+			mlir::Value element_ptr = materialize_partition_view_element_ptr(partition, indices, partition_local_index, loc, rewriter);
+			return mlir::spirv::LoadOp::create(rewriter, loc, element_ptr);
+		}
+
+		assert(indices.size() == 2);
+		assert(pview_info.tile_shape.size() == 2);
+
+		mlir::Type i32_type = rewriter.getI32Type();
+
+		for (mlir::Value &index : indices)
+			index = materialize_scalar(index, loc, rewriter, partition);
+
+		auto materialize_index_value = [&](IndexValue value) -> mlir::Value {
+			if (value.is_static())
+				return get_or_create_i32_constant(value.static_value, loc, rewriter);
+
+			return materialize_scalar(value.dynamic_value, loc, rewriter, partition);
+		};
+
+		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
+
+		mlir::Value local_row = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, partition_local_index, tile_n);
+		mlir::Value local_col = mlir::spirv::UModOp::create(rewriter, loc, i32_type, partition_local_index, tile_n);
+
+		mlir::Value global_row = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_m), local_row);
+
+		mlir::Value global_col = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[1], tile_n), local_col);
+
+		mlir::Value dim0 = materialize_index_value(tview_info.shape[0]);
+		mlir::Value dim1 = materialize_index_value(tview_info.shape[1]);
+
+		mlir::Value row_in_bounds = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_row, dim0);
+		mlir::Value col_in_bounds = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_col, dim1);
+		mlir::Value in_bounds = mlir::spirv::LogicalAndOp::create(rewriter, loc, rewriter.getI1Type(), row_in_bounds, col_in_bounds);
+
+		mlir::Value stride0 = materialize_index_value(tview_info.strides[0]);
+		mlir::Value stride1 = materialize_index_value(tview_info.strides[1]);
+
+		mlir::Value row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_row, stride0);
+		mlir::Value col_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_col, stride1);
+		mlir::Value linear_offset = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, row_offset, col_offset);
+
+		mlir::Value zero_i32 = get_or_create_i32_constant(0, loc, rewriter);
+		mlir::Value safe_offset = mlir::spirv::SelectOp::create(rewriter, loc, i32_type, in_bounds, linear_offset, zero_i32);
+
+		mlir::Value base_ptr = rewriter.getRemappedValue(tview_info.base_ptr);
+		if (!base_ptr)
+			base_ptr = tview_info.base_ptr;
+
+		mlir::Value member_index = get_or_create_i32_constant(0, loc, rewriter);
+		mlir::Value element_ptr = mlir::spirv::AccessChainOp::create(rewriter, loc, base_ptr, mlir::ValueRange{member_index, safe_offset});
+
+		mlir::Value loaded = mlir::spirv::LoadOp::create(rewriter, loc, element_ptr);
+
+		mlir::Value zero_value;
+		if (auto float_type = mlir::dyn_cast<mlir::FloatType>(loaded.getType())) {
+			zero_value = mlir::spirv::ConstantOp::create(rewriter, loc, loaded.getType(), mlir::FloatAttr::get(float_type, 0.0));
+		} else if (auto integer_type = mlir::dyn_cast<mlir::IntegerType>(loaded.getType())) {
+			zero_value = mlir::spirv::ConstantOp::create(rewriter, loc, loaded.getType(), rewriter.getIntegerAttr(integer_type, 0));
+		} else {
+			llvm::report_fatal_error("unsupported zero padding element type");
+		}
+
+		return mlir::spirv::SelectOp::create(rewriter, loc, loaded.getType(), in_bounds, loaded, zero_value);
 	}
 
 	mlir::Value materialize_fadd(mlir::cuda_tile::AddFOp op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value element_index) {
@@ -466,8 +568,9 @@ struct TileMaterializer {
 		assert(acc_shape[0] == m);
 		assert(acc_shape[1] == n);
 
-		mlir::Value output_tile_size = get_or_create_i32_constant(m * n, loc, rewriter);
+		mlir::Block *parent_block = rewriter.getInsertionBlock();
 
+		mlir::Value output_tile_size = get_or_create_i32_constant(m * n, loc, rewriter);
 		element_index = mlir::spirv::UModOp::create(rewriter, loc, i32_type, element_index, output_tile_size);
 
 		mlir::Value n_value = get_or_create_i32_constant(n, loc, rewriter);
@@ -476,12 +579,26 @@ struct TileMaterializer {
 		mlir::Value col = mlir::spirv::UModOp::create(rewriter, loc, i32_type, element_index, n_value);
 
 		mlir::Value initial_result = materialize_scalar(op.getAcc(), loc, rewriter);
+		mlir::Value zero = get_or_create_i32_constant(0, loc, rewriter);
 
-		llvm::SmallVector<mlir::Type> result_types;
-		result_types.push_back(initial_result.getType());
+		mlir::Value acc_ptr;
+		{
+			mlir::OpBuilder::InsertionGuard variable_guard(rewriter);
+
+			rewriter.setInsertionPointToStart(parent_block);
+
+			auto acc_ptr_type = mlir::spirv::PointerType::get(initial_result.getType(), mlir::spirv::StorageClass::Function);
+
+			mlir::OperationState variable_state(loc, mlir::spirv::VariableOp::getOperationName());
+			variable_state.addTypes(acc_ptr_type);
+			variable_state.addAttribute("storage_class", mlir::spirv::StorageClassAttr::get(rewriter.getContext(), mlir::spirv::StorageClass::Function));
+
+			acc_ptr = rewriter.create(variable_state)->getResult(0);
+		}
+
+		mlir::spirv::StoreOp::create(rewriter, loc, acc_ptr, initial_result);
 
 		mlir::OperationState state(loc, mlir::spirv::LoopOp::getOperationName());
-		state.addTypes(result_types);
 		state.addAttribute("loop_control", mlir::spirv::LoopControlAttr::get(rewriter.getContext(), mlir::spirv::LoopControl::None));
 		state.addRegion();
 
@@ -509,13 +626,9 @@ struct TileMaterializer {
 		continue_block->addArgument(i32_type, loc);
 		continue_block->addArgument(initial_result.getType(), loc);
 
-		merge_block->addArgument(initial_result.getType(), loc);
-
 		auto block_args = [](mlir::Block *block) { return llvm::SmallVector<mlir::Value>(block->getArguments().begin(), block->getArguments().end()); };
 
 		rewriter.setInsertionPointToStart(entry_block);
-
-		mlir::Value zero = get_or_create_i32_constant(0, loc, rewriter);
 		mlir::spirv::BranchOp::create(rewriter, loc, header_block, mlir::ValueRange{zero, initial_result});
 
 		rewriter.setInsertionPointToStart(header_block);
@@ -524,7 +637,7 @@ struct TileMaterializer {
 		mlir::Value current_result = header_block->getArgument(1);
 		mlir::Value condition = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), k_index, get_or_create_i32_constant(k, loc, rewriter));
 
-		mlir::spirv::BranchConditionalOp::create(rewriter, loc, condition, body_block, block_args(header_block), merge_block, mlir::ValueRange{current_result});
+		mlir::spirv::BranchConditionalOp::create(rewriter, loc, condition, body_block, block_args(header_block), merge_block, mlir::ValueRange{});
 
 		rewriter.setInsertionPointToStart(body_block);
 
@@ -544,21 +657,21 @@ struct TileMaterializer {
 		mlir::Value next_result = mlir::spirv::FAddOp::create(rewriter, loc, body_result.getType(), body_result, product);
 		mlir::Value next_k_index = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, body_k_index, get_or_create_i32_constant(1, loc, rewriter));
 
+		mlir::spirv::StoreOp::create(rewriter, loc, acc_ptr, next_result);
 		mlir::spirv::BranchOp::create(rewriter, loc, continue_block, mlir::ValueRange{next_k_index, next_result});
 
 		rewriter.setInsertionPointToStart(continue_block);
 		mlir::spirv::BranchOp::create(rewriter, loc, header_block, block_args(continue_block));
 
 		rewriter.setInsertionPointToStart(merge_block);
-		mlir::spirv::MergeOp::create(rewriter, loc, block_args(merge_block));
+		mlir::spirv::MergeOp::create(rewriter, loc, mlir::ValueRange{});
 
-		return loop_op->getResult(0);
+		rewriter.setInsertionPointAfter(loop_op);
+		return mlir::spirv::LoadOp::create(rewriter, loc, acc_ptr);
 	}
 
 	mlir::Value materialize_mmaf(mlir::cuda_tile::MmaFOp op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value element_index) {
 		mlir::Type i32_type = rewriter.getI32Type();
-
-		auto make_i32_constant = [&](int64_t value) -> mlir::Value { return mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, value)); };
 
 		auto lhs_type = op.getLhs().getType();
 		auto rhs_type = op.getRhs().getType();
@@ -578,11 +691,11 @@ struct TileMaterializer {
 		assert(acc_shape[0] == m);
 		assert(acc_shape[1] == n);
 
-		mlir::Value output_tile_size = make_i32_constant(m * n);
+		mlir::Value output_tile_size = get_or_create_i32_constant(m * n, loc, rewriter);
 
 		element_index = mlir::spirv::UModOp::create(rewriter, loc, i32_type, element_index, output_tile_size);
 
-		mlir::Value n_value = make_i32_constant(n);
+		mlir::Value n_value = get_or_create_i32_constant(n, loc, rewriter);
 
 		mlir::Value row = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, element_index, n_value);
 
@@ -591,11 +704,11 @@ struct TileMaterializer {
 		mlir::Value result = materialize_scalar(op.getAcc(), loc, rewriter);
 
 		for (int64_t k_index = 0; k_index < k; ++k_index) {
-			mlir::Value lhs_row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, row, make_i32_constant(k));
+			mlir::Value lhs_row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, row, get_or_create_i32_constant(k, loc, rewriter));
 
-			mlir::Value lhs_index = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, lhs_row_offset, make_i32_constant(k_index));
+			mlir::Value lhs_index = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, lhs_row_offset, get_or_create_i32_constant(k_index, loc, rewriter));
 
-			mlir::Value rhs_row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, make_i32_constant(k_index), make_i32_constant(n));
+			mlir::Value rhs_row_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, get_or_create_i32_constant(k_index, loc, rewriter), get_or_create_i32_constant(n, loc, rewriter));
 
 			mlir::Value rhs_index = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, rhs_row_offset, col);
 
@@ -611,61 +724,59 @@ struct TileMaterializer {
 		return result;
 	}
 
-	llvm::SmallVector<mlir::Value, 3> materialize_get_tile_block_id(mlir::cuda_tile::GetTileBlockIdOp op, mlir::Value partition_view, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter) {
-		PartitionViewInfo &pview_info = lowering_context.partition_views[partition_view];
-		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
+	static bool op_attrs_contain(mlir::Operation *op, llvm::StringRef text) {
+		for (mlir::NamedAttribute attr : op->getAttrs()) {
+			std::string value;
+			llvm::raw_string_ostream stream(value);
+			attr.getValue().print(stream);
+			stream.flush();
 
+			if (llvm::StringRef(value).contains(text))
+				return true;
+		}
+
+		return false;
+	}
+
+	mlir::Value materialize_divi(mlir::cuda_tile::DivIOp op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value partition_view = {}) {
+		mlir::Value lhs = materialize_scalar(op.getLhs(), loc, rewriter, partition_view);
+		mlir::Value rhs = materialize_scalar(op.getRhs(), loc, rewriter, partition_view);
+
+		if (op_attrs_contain(op.getOperation(), "positive_inf")) {
+			mlir::Type i32_type = rewriter.getI32Type();
+
+			mlir::Value one = get_or_create_i32_constant(1, loc, rewriter);
+			mlir::Value rhs_minus_one = mlir::spirv::ISubOp::create(rewriter, loc, i32_type, rhs, one);
+			mlir::Value numerator = mlir::spirv::IAddOp::create(rewriter, loc, i32_type, lhs, rhs_minus_one);
+
+			return mlir::spirv::UDivOp::create(rewriter, loc, i32_type, numerator, rhs);
+		}
+
+		return mlir::spirv::UDivOp::create(rewriter, loc, lhs.getType(), lhs, rhs);
+	}
+
+	llvm::SmallVector<mlir::Value, 3> materialize_get_tile_block_id(mlir::cuda_tile::GetTileBlockIdOp op, mlir::Value partition_view, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter) {
 		mlir::Type i32_type = rewriter.getI32Type();
 
-		auto make_i32_constant = [&](int64_t value) -> mlir::Value { return mlir::spirv::ConstantOp::create(rewriter, loc, i32_type, rewriter.getIntegerAttr(i32_type, value)); };
+		mlir::Value global_id = mlir::spirv::getBuiltinVariableValue(op.getOperation(), mlir::spirv::BuiltIn::GlobalInvocationId, i32_type, rewriter);
 
-		auto ceil_div_static = [](int64_t lhs, int64_t rhs) -> int64_t { return (lhs + rhs - 1) / rhs; };
+		mlir::Value workgroup_size = mlir::spirv::getBuiltinVariableValue(op.getOperation(), mlir::spirv::BuiltIn::WorkgroupSize, i32_type, rewriter);
 
-		auto materialize_ceil_div = [&](IndexValue lhs, int64_t rhs) -> mlir::Value {
-			if (lhs.is_static()) {
-				return make_i32_constant(ceil_div_static(lhs.static_value, rhs));
-			}
+		auto extract = [&](mlir::Value value, int32_t index) -> mlir::Value { return mlir::spirv::CompositeExtractOp::create(rewriter, loc, value, llvm::ArrayRef<int32_t>{index}); };
 
-			mlir::Value lhs_value = get_remapped_index_or_self(lhs.dynamic_value, rewriter);
+		mlir::Value global_x = extract(global_id, 0);
+		mlir::Value global_y = extract(global_id, 1);
+		mlir::Value global_z = extract(global_id, 2);
 
-			if (rhs == 1) {
-				return lhs_value;
-			}
+		mlir::Value size_x = extract(workgroup_size, 0);
+		mlir::Value size_y = extract(workgroup_size, 1);
+		mlir::Value size_z = extract(workgroup_size, 2);
 
-			mlir::Value rhs_value = make_i32_constant(rhs);
-			mlir::Value offset = make_i32_constant(rhs - 1);
-			mlir::Value numerator = mlir::spirv::IAddOp::create(rewriter, loc, lhs_value, offset);
+		mlir::Value block_x = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, global_x, size_x);
+		mlir::Value block_y = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, global_y, size_y);
+		mlir::Value block_z = mlir::spirv::UDivOp::create(rewriter, loc, i32_type, global_z, size_z);
 
-			return mlir::spirv::UDivOp::create(rewriter, loc, numerator, rhs_value);
-		};
-
-		auto materialize_num_tile_blocks = [&](int64_t dim) -> mlir::Value {
-			IndexValue tensor_dim = dim < tview_info.shape.size() ? tview_info.shape[dim] : IndexValue::from_static(1);
-			int64_t tile_dim = dim < pview_info.tile_shape.size() ? pview_info.tile_shape[dim] : 1;
-
-			return materialize_ceil_div(tensor_dim, tile_dim);
-		};
-
-		int32_t total_tile_size = 1;
-		for (int32_t value : pview_info.tile_shape)
-			total_tile_size *= value;
-
-		mlir::Value global_linear_id = get_or_create_global_linear_index(op.getOperation(), loc, rewriter);
-		mlir::Value total_tile_size_value = make_i32_constant(total_tile_size);
-		mlir::Value tile_linear_id = mlir::spirv::UDivOp::create(rewriter, loc, global_linear_id, total_tile_size_value);
-
-		mlir::Value num_tile_blocks_x = materialize_num_tile_blocks(0);
-		mlir::Value num_tile_blocks_y = materialize_num_tile_blocks(1);
-
-		mlir::Value tile_block_x = mlir::spirv::UModOp::create(rewriter, loc, tile_linear_id, num_tile_blocks_x);
-
-		mlir::Value div_x = mlir::spirv::UDivOp::create(rewriter, loc, tile_linear_id, num_tile_blocks_x);
-
-		mlir::Value tile_block_y = mlir::spirv::UModOp::create(rewriter, loc, div_x, num_tile_blocks_y);
-
-		mlir::Value tile_block_z = mlir::spirv::UDivOp::create(rewriter, loc, div_x, num_tile_blocks_y);
-
-		return {tile_block_x, tile_block_y, tile_block_z};
+		return {block_x, block_y, block_z};
 	}
 
 	mlir::Value materialize_for(mlir::cuda_tile::ForOp op, unsigned result_index, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value element_index) {
@@ -687,8 +798,35 @@ struct TileMaterializer {
 		for (mlir::Value value : init_values)
 			result_types.push_back(value.getType());
 
+		llvm::SmallVector<mlir::Value> result_ptrs;
+		{
+			mlir::OpBuilder::InsertionGuard variable_guard(rewriter);
+
+			mlir::Operation *parent_op = rewriter.getInsertionBlock()->getParentOp();
+			auto func_op = mlir::dyn_cast<mlir::spirv::FuncOp>(parent_op);
+
+			if (!func_op)
+				func_op = parent_op->getParentOfType<mlir::spirv::FuncOp>();
+
+			assert(func_op && "materialize_for must be inside a spirv.func");
+
+			rewriter.setInsertionPointToStart(&func_op.front());
+
+			for (mlir::Type type : result_types) {
+				auto ptr_type = mlir::spirv::PointerType::get(type, mlir::spirv::StorageClass::Function);
+
+				mlir::OperationState variable_state(loc, mlir::spirv::VariableOp::getOperationName());
+				variable_state.addTypes(ptr_type);
+				variable_state.addAttribute("storage_class", mlir::spirv::StorageClassAttr::get(rewriter.getContext(), mlir::spirv::StorageClass::Function));
+
+				result_ptrs.push_back(rewriter.create(variable_state)->getResult(0));
+			}
+		}
+
+		for (unsigned i = 0; i < result_count; ++i)
+			mlir::spirv::StoreOp::create(rewriter, loc, result_ptrs[i], init_values[i]);
+
 		mlir::OperationState state(loc, mlir::spirv::LoopOp::getOperationName());
-		state.addTypes(result_types);
 		state.addAttribute("loop_control", mlir::spirv::LoopControlAttr::get(rewriter.getContext(), mlir::spirv::LoopControl::None));
 		state.addRegion();
 
@@ -715,7 +853,6 @@ struct TileMaterializer {
 			header_block->addArgument(type, loc);
 			body_block->addArgument(type, loc);
 			continue_block->addArgument(type, loc);
-			merge_block->addArgument(type, loc);
 		}
 
 		auto block_args = [](mlir::Block *block) { return llvm::SmallVector<mlir::Value>(block->getArguments().begin(), block->getArguments().end()); };
@@ -731,9 +868,7 @@ struct TileMaterializer {
 
 		mlir::Value condition = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), header_block->getArgument(0), upper_bound);
 
-		llvm::SmallVector<mlir::Value> merge_args(header_block->getArguments().begin() + 1, header_block->getArguments().end());
-
-		mlir::spirv::BranchConditionalOp::create(rewriter, loc, condition, body_block, block_args(header_block), merge_block, merge_args);
+		mlir::spirv::BranchConditionalOp::create(rewriter, loc, condition, body_block, block_args(header_block), merge_block, mlir::ValueRange{});
 
 		mlir::Block &old_body = *op.getBody();
 		auto continue_op = mlir::cast<mlir::cuda_tile::ContinueOp>(old_body.getTerminator());
@@ -762,6 +897,9 @@ struct TileMaterializer {
 
 		mlir::Value next_index = mlir::spirv::IAddOp::create(rewriter, loc, body_block->getArgument(0), step);
 
+		for (unsigned i = 0; i < result_count; ++i)
+			mlir::spirv::StoreOp::create(rewriter, loc, result_ptrs[i], continue_values[i]);
+
 		llvm::SmallVector<mlir::Value> continue_args;
 		continue_args.push_back(next_index);
 		continue_args.append(continue_values.begin(), continue_values.end());
@@ -779,9 +917,10 @@ struct TileMaterializer {
 		mlir::spirv::BranchOp::create(rewriter, loc, header_block, block_args(continue_block));
 
 		rewriter.setInsertionPointToStart(merge_block);
-		mlir::spirv::MergeOp::create(rewriter, loc, block_args(merge_block));
+		mlir::spirv::MergeOp::create(rewriter, loc, mlir::ValueRange{});
 
-		return loop_op->getResult(result_index);
+		rewriter.setInsertionPointAfter(loop_op);
+		return mlir::spirv::LoadOp::create(rewriter, loc, result_ptrs[result_index]);
 	}
 
 	mlir::Value materialize_get_index_space_shape(mlir::cuda_tile::GetIndexSpaceShapeOp op, unsigned result_index, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter) {
@@ -847,10 +986,30 @@ struct StoreViewTkoOpConversion final : mlir::OpConversionPattern<mlir::cuda_til
 
 		llvm::SmallVector<mlir::Value> indices(op.getIndex().begin(), op.getIndex().end());
 
+		mlir::Value in_bounds = materializer.materialize_partition_view_in_bounds(op.getView(), indices, partition_local_index, loc, rewriter);
 		mlir::Value element_ptr = materializer.materialize_partition_view_element_ptr(op.getView(), indices, partition_local_index, loc, rewriter);
 
-		mlir::spirv::StoreOp::create(rewriter, loc, element_ptr, element_value);
+		auto selection_op = mlir::spirv::SelectionOp::create(rewriter, loc, mlir::spirv::SelectionControl::None);
 
+		mlir::Block *header_block = new mlir::Block();
+		mlir::Block *store_block = new mlir::Block();
+		mlir::Block *merge_block = new mlir::Block();
+
+		selection_op.getBody().push_back(header_block);
+		selection_op.getBody().push_back(store_block);
+		selection_op.getBody().push_back(merge_block);
+
+		rewriter.setInsertionPointToStart(header_block);
+		mlir::spirv::BranchConditionalOp::create(rewriter, loc, in_bounds, store_block, mlir::ValueRange{}, merge_block, mlir::ValueRange{});
+
+		rewriter.setInsertionPointToStart(store_block);
+		mlir::spirv::StoreOp::create(rewriter, loc, element_ptr, element_value);
+		mlir::spirv::BranchOp::create(rewriter, loc, merge_block);
+
+		rewriter.setInsertionPointToStart(merge_block);
+		mlir::spirv::MergeOp::create(rewriter, loc, mlir::ValueRange{});
+
+		rewriter.setInsertionPointAfter(selection_op);
 		rewriter.eraseOp(op);
 
 		return mlir::success();
