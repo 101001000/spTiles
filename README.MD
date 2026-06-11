@@ -1,6 +1,6 @@
 # CUDA Tile to SPIR-V translator
 
-Small MLIR-based translator that loads CUDA Tile IR and lowers it to a SPIR-V module.
+Small MLIR-based translator that loads CUDA Tile IR and lowers a supported subset of it to a SPIR-V compute module.
 
 ## What it does
 
@@ -15,38 +15,72 @@ It then:
 1. Loads the CUDA Tile module.
 2. Verifies the input IR.
 3. Lowers the CUDA Tile module shell to a SPIR-V module shell.
-4. Lowers the supported CUDA Tile operations to SPIR-V operations.
+4. Lowers a supported subset of CUDA Tile operations to SPIR-V.
 5. Writes the generated SPIR-V binary to:
 
 ```bash
 ./output.spv
 ```
 
-## Currently supported lowering
+The lowering currently focuses on a small subset of CUDA Tile programs, including elementwise operations such as add, matrix multiply accumulation through `mmaf`, and simple control-flow constructs such as `for`.
 
-The current lowering handles the basic vector-add style path:
+## Execution model
 
-- `cuda_tile.module` to `spirv.module`
-- `cuda_tile.entry` to `spirv.func`
-- `cuda_tile.get_tile_block_id`
-- `cuda_tile.load_view_tko`
-- `cuda_tile.addf`
-- `cuda_tile.store_view_tko`
-- `cuda_tile.return`
+The generated SPIR-V kernel is parallelized at the tile-element level.
 
-The generated SPIR-V uses a fixed local size of:
+Each invocation computes one element of a logical tile. A fixed workgroup size is used, and the translator maps the global invocation id to:
 
-```text
-16 x 1 x 1
-```
+* the logical tile being processed,
+* the local element inside that tile,
+* and the corresponding tensor element in storage-buffer memory.
 
-## Example
+For tiled matrix multiplication, this means each output tile is decomposed into independent scalar element computations, while the accumulation across the reduction dimension is lowered to SPIR-V control flow.
+
+## Examples
+
+### Vector add
+
+Translate the CUDA Tile bytecode:
 
 ```bash
 ./sp_tiles_translate ../shaders/vector_add.tilebc
 ```
 
-Expected result:
+Run the generated SPIR-V binary:
+
+```bash
+./sp_tiles_translate_test vector_add output.spv 2048
+```
+
+### Matrix multiplication
+
+Translate the CUDA Tile bytecode:
+
+```bash
+./sp_tiles_translate ../shaders/matmul.tilebc
+```
+
+Run the generated SPIR-V binary:
+
+```bash
+./sp_tiles_translate_test matmul output.spv 256 256 256
+```
+
+The matrix multiplication test arguments are:
+
+```text
+M N K
+```
+
+so the example above runs:
+
+```text
+C[M x N] = A[M x K] @ B[K x N]
+```
+
+## Expected output
+
+A successful translation prints messages similar to:
 
 ```text
 loaded CUDA Tile input successfully
@@ -54,6 +88,18 @@ converted CUDA Tile module shell to SPIR-V module shell
 wrote SPIR-V binary to ./output.spv
 ```
 
+A successful test run prints a confirmation such as:
+
+```text
+matmul OK: 256x256 @ 256x256
+```
+
+or:
+
+```text
+vector_add OK: 2048 elements
+```
+
 ## Notes
 
-This is an experimental lowering pass focused on CUDA Tile kernels that operate over `f32` storage buffers.
+This is an experimental lowering pass for CUDA Tile kernels targeting SPIR-V compute shaders. The implementation is intentionally limited and currently supports only a small subset of CUDA Tile operations and types, with the main focus on `f32` storage-buffer based kernels.
