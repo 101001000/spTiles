@@ -47,11 +47,11 @@ static void erase_dead_cuda_tile_ops(mlir::ModuleOp root_module) {
 			}
 
 			if (!op->use_empty()) {
-				llvm::errs() << "live: " << op->getName().getStringRef() << "\n";
+				//llvm::errs() << "live: " << op->getName().getStringRef() << "\n";
 
 				for (mlir::Value result : op->getResults()) {
 					for (mlir::OpOperand &use : result.getUses()) {
-						llvm::errs() << "  used by: " << use.getOwner()->getName().getStringRef() << " operand " << use.getOperandNumber() << "\n";
+						//llvm::errs() << "  used by: " << use.getOwner()->getName().getStringRef() << " operand " << use.getOperandNumber() << "\n";
 					}
 				}
 
@@ -62,7 +62,7 @@ static void erase_dead_cuda_tile_ops(mlir::ModuleOp root_module) {
 		});
 
 		for (mlir::Operation *op : llvm::reverse(ops)) {
-			llvm::errs() << "erase dead: " << op->getName().getStringRef() << "\n";
+			//llvm::errs() << "erase dead: " << op->getName().getStringRef() << "\n";
 			op->erase();
 			changed = true;
 		}
@@ -244,6 +244,9 @@ struct TileMaterializer {
 			if (auto addf_op = mlir::dyn_cast<mlir::cuda_tile::AddFOp>(op))
 				return materialize_fadd(addf_op, loc, rewriter, element_index);
 
+			if (auto fma_op = mlir::dyn_cast<mlir::cuda_tile::FmaOp>(op))
+				return materialize_fma(fma_op, loc, rewriter, element_index);
+
 			if (auto mmaf_op = mlir::dyn_cast<mlir::cuda_tile::MmaFOp>(op))
 				return materialize_mmaf_for(mmaf_op, loc, rewriter, element_index); // segfault
 				                                                                    // return materialize_mmaf(mmaf_op, loc, rewriter, element_index); // funciona
@@ -307,10 +310,10 @@ struct TileMaterializer {
 		PartitionViewInfo &pview_info = lowering_context.partition_views[partition_view];
 		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
 
-		assert(indices.size() == 2);
-		assert(pview_info.tile_shape.size() == 2);
-		assert(tview_info.shape.size() == 2);
-		assert(tview_info.strides.size() == 2);
+		assert(indices.size() == pview_info.tile_shape.size());
+		assert(pview_info.tile_shape.size() == tview_info.shape.size());
+		assert(tview_info.shape.size() == tview_info.strides.size());
+		assert(tview_info.shape.size() == 1 || tview_info.shape.size() == 2);
 
 		mlir::Type i32_type = rewriter.getI32Type();
 
@@ -323,6 +326,24 @@ struct TileMaterializer {
 
 			return materialize_scalar(value.dynamic_value, loc, rewriter, partition_view);
 		};
+
+		if (tview_info.shape.size() == 1) {
+			mlir::Value tile_size = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+			mlir::Value global_index = mlir::spirv::IAddOp::create(
+				rewriter, loc, i32_type,
+				mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_size),
+				element_index);
+
+			mlir::Value stride = get_index_value(tview_info.strides[0]);
+			mlir::Value linear_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_index, stride);
+
+			mlir::Value base_ptr = rewriter.getRemappedValue(tview_info.base_ptr);
+			if (!base_ptr)
+				base_ptr = tview_info.base_ptr;
+
+			mlir::Value member_index = get_or_create_i32_constant(0, loc, rewriter);
+			return mlir::spirv::AccessChainOp::create(rewriter, loc, base_ptr, mlir::ValueRange{member_index, linear_offset});
+		}
 
 		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
 		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
@@ -431,8 +452,9 @@ struct TileMaterializer {
 		PartitionViewInfo &pview_info = lowering_context.partition_views[partition_view];
 		TensorViewInfo &tview_info = lowering_context.tensor_views[pview_info.tensor_view];
 
-		assert(indices.size() == 2);
-		assert(pview_info.tile_shape.size() == 2);
+		assert(indices.size() == pview_info.tile_shape.size());
+		assert(pview_info.tile_shape.size() == tview_info.shape.size());
+		assert(tview_info.shape.size() == 1 || tview_info.shape.size() == 2);
 
 		mlir::Type i32_type = rewriter.getI32Type();
 
@@ -445,6 +467,16 @@ struct TileMaterializer {
 
 			return materialize_scalar(value.dynamic_value, loc, rewriter, partition_view);
 		};
+
+		if (tview_info.shape.size() == 1) {
+			mlir::Value tile_size = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+			mlir::Value global_index = mlir::spirv::IAddOp::create(
+				rewriter, loc, i32_type,
+				mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_size),
+				element_index);
+
+			return mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_index, materialize_index_value(tview_info.shape[0]));
+		}
 
 		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
 		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
@@ -476,8 +508,9 @@ struct TileMaterializer {
 			return mlir::spirv::LoadOp::create(rewriter, loc, element_ptr);
 		}
 
-		assert(indices.size() == 2);
-		assert(pview_info.tile_shape.size() == 2);
+		assert(indices.size() == pview_info.tile_shape.size());
+		assert(pview_info.tile_shape.size() == tview_info.shape.size());
+		assert(tview_info.shape.size() == 1 || tview_info.shape.size() == 2);
 
 		mlir::Type i32_type = rewriter.getI32Type();
 
@@ -490,6 +523,41 @@ struct TileMaterializer {
 
 			return materialize_scalar(value.dynamic_value, loc, rewriter, partition);
 		};
+
+		if (tview_info.shape.size() == 1) {
+			mlir::Value tile_size = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
+			mlir::Value global_index = mlir::spirv::IAddOp::create(
+				rewriter, loc, i32_type,
+				mlir::spirv::IMulOp::create(rewriter, loc, i32_type, indices[0], tile_size),
+				partition_local_index);
+
+			mlir::Value in_bounds = mlir::spirv::ULessThanOp::create(rewriter, loc, rewriter.getI1Type(), global_index, materialize_index_value(tview_info.shape[0]));
+			mlir::Value stride = materialize_index_value(tview_info.strides[0]);
+			mlir::Value linear_offset = mlir::spirv::IMulOp::create(rewriter, loc, i32_type, global_index, stride);
+
+			mlir::Value zero_i32 = get_or_create_i32_constant(0, loc, rewriter);
+			mlir::Value safe_offset = mlir::spirv::SelectOp::create(rewriter, loc, i32_type, in_bounds, linear_offset, zero_i32);
+
+			mlir::Value base_ptr = rewriter.getRemappedValue(tview_info.base_ptr);
+			if (!base_ptr)
+				base_ptr = tview_info.base_ptr;
+
+			mlir::Value member_index = get_or_create_i32_constant(0, loc, rewriter);
+			mlir::Value element_ptr = mlir::spirv::AccessChainOp::create(rewriter, loc, base_ptr, mlir::ValueRange{member_index, safe_offset});
+
+			mlir::Value loaded = mlir::spirv::LoadOp::create(rewriter, loc, element_ptr);
+
+			mlir::Value zero_value;
+			if (auto float_type = mlir::dyn_cast<mlir::FloatType>(loaded.getType())) {
+				zero_value = mlir::spirv::ConstantOp::create(rewriter, loc, loaded.getType(), mlir::FloatAttr::get(float_type, 0.0));
+			} else if (auto integer_type = mlir::dyn_cast<mlir::IntegerType>(loaded.getType())) {
+				zero_value = mlir::spirv::ConstantOp::create(rewriter, loc, loaded.getType(), rewriter.getIntegerAttr(integer_type, 0));
+			} else {
+				llvm::report_fatal_error("unsupported zero padding element type");
+			}
+
+			return mlir::spirv::SelectOp::create(rewriter, loc, loaded.getType(), in_bounds, loaded, zero_value);
+		}
 
 		mlir::Value tile_m = get_or_create_i32_constant(pview_info.tile_shape[0], loc, rewriter);
 		mlir::Value tile_n = get_or_create_i32_constant(pview_info.tile_shape[1], loc, rewriter);
@@ -543,6 +611,15 @@ struct TileMaterializer {
 		mlir::Value lhs = materialize_tile_element(op.getLhs(), loc, rewriter, element_index);
 		mlir::Value rhs = materialize_tile_element(op.getRhs(), loc, rewriter, element_index);
 		return mlir::spirv::FAddOp::create(rewriter, loc, lhs.getType(), lhs, rhs);
+	}
+
+	mlir::Value materialize_fma(mlir::cuda_tile::FmaOp op, mlir::Location loc,
+								mlir::ConversionPatternRewriter &rewriter,
+								mlir::Value element_index) {
+		mlir::Value lhs = materialize_tile_element(op.getLhs(), loc, rewriter, element_index);
+		mlir::Value rhs = materialize_tile_element(op.getRhs(), loc, rewriter, element_index);
+		mlir::Value acc = materialize_tile_element(op.getAcc(), loc, rewriter, element_index);
+		return mlir::spirv::GLFmaOp::create(rewriter, loc, lhs.getType(), lhs, rhs, acc);
 	}
 
 	mlir::Value materialize_mmaf_for(mlir::cuda_tile::MmaFOp op, mlir::Location loc, mlir::ConversionPatternRewriter &rewriter, mlir::Value element_index) {
